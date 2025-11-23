@@ -2,3 +2,5 @@ streamlit
 pandas
 altair
 requests
+gspread
+google-auth
