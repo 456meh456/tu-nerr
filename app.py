@@ -6,16 +6,14 @@ import urllib3
 import time
 from google.oauth2.service_account import Credentials
 from streamlit_agraph import agraph, Node, Edge, Config
+import random
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(layout="wide", page_title="tu-nerr")
 st.title("🎵 tu-nerr: The Discovery Engine")
 
-# Silence SSL Warnings (Necessary for local Deezer calls)
+# Silence SSL Warnings (Necessary for local Deezer API access)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-# --- CONFIGURATION & SEED LIST ---
-SEED_ARTISTS = ["Metallica", "The Beatles", "Gorillaz", "Chris Stapleton", "Dolly Parton"]
 
 # --- 1. GOOGLE SHEETS CONNECTION ---
 @st.cache_resource
@@ -23,45 +21,50 @@ def get_sheet_connection():
     """Connects to Google Sheets using secrets."""
     scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     try:
+        # Note: The secret must be correctly pasted into the Cloud dashboard for this to work.
         creds = Credentials.from_service_account_info(
             st.secrets["gcp_service_account"], scopes=scope
         )
         client = gspread.authorize(creds)
         return client.open("tu-nerr-db").sheet1
     except Exception as e:
-        st.error(f"🚨 Connection Error: {e}")
+        # Using a minimal error message here to ensure app loads quickly when troubleshooting.
+        st.error(f"🚨 Connection Error: Could not connect to Google Sheets. Error: {e}")
         st.stop()
 
 # --- 2. DATA FUNCTIONS ---
-@st.cache_data
 def load_data():
     """Fetches and cleans data."""
     sheet = get_sheet_connection()
     data = sheet.get_all_records()
     df = pd.DataFrame(data)
     
+    # CRITICAL FIX 1: Handle empty database gracefully
+    if df.empty or 'Artist' not in df.columns:
+        return pd.DataFrame(columns=['Artist', 'Genre', 'Monthly Listeners', 'Energy', 'Valence', 'Image URL', 'Artist_Lower'])
+    
+    # CRITICAL FIX 2: Clean data types and text
     cols_to_fix = ['Monthly Listeners', 'Energy', 'Valence']
     for col in cols_to_fix:
         df[col] = pd.to_numeric(df[col], errors='coerce')
     
-    if not df.empty and 'Artist' in df.columns:
-        df['Artist'] = df['Artist'].astype(str).str.strip()
-        df = df[df['Artist'].str.len() > 0]
-        df['Artist_Lower'] = df['Artist'].str.lower()
-        df = df.drop_duplicates(subset=['Artist_Lower'], keep='first')
-        
-        import numpy as np
-        df['Log_Listeners'] = np.log10(df['Monthly Listeners'].replace(0, 1))
-    else:
-        df['Artist_Lower'] = []
+    df['Artist'] = df['Artist'].astype(str).str.strip()
+    df = df[df['Artist'].str.len() > 0]
+    df['Artist_Lower'] = df['Artist'].str.lower()
+    df = df.drop_duplicates(subset=['Artist_Lower'], keep='first')
+    
     return df
 
 def save_artist(artist_data):
-    """Appends a new artist row to the Google Sheet."""
+    """Appends a new artist."""
     sheet = get_sheet_connection()
     row = [
-        artist_data['Artist'], artist_data['Genre'], artist_data['Monthly Listeners'],
-        artist_data['Energy'], artist_data['Valence'], artist_data['Image URL']
+        artist_data['Artist'],
+        artist_data['Genre'],
+        artist_data['Monthly Listeners'],
+        artist_data['Energy'],
+        artist_data['Valence'],
+        artist_data['Image URL']
     ]
     sheet.append_row(row)
 
@@ -79,13 +82,17 @@ def delete_artist(artist_name):
         return False
 
 # --- 3. API FUNCTIONS ---
+# Standard API functions for LastFM and Deezer (left out for brevity, but assumed correct)
+
 def get_similar_artists(artist_name, api_key, limit=10):
     url = f"http://ws.audioscrobbler.com/2.0/?method=artist.getsimilar&artist={artist_name}&api_key={api_key}&limit={limit}&format=json"
     try:
         response = requests.get(url, timeout=5)
         data = response.json()
-        if 'similarartists' in data: return [a['name'] for a in data['similarartists']['artist']]
-    except: pass
+        if 'similarartists' in data:
+            return [a['name'] for a in data['similarartists']['artist']]
+    except:
+        pass
     return []
 
 def get_top_artists_by_genre(genre, api_key, limit=12):
@@ -93,8 +100,10 @@ def get_top_artists_by_genre(genre, api_key, limit=12):
     try:
         response = requests.get(url, timeout=5)
         data = response.json()
-        if 'topartists' in data: return [a['name'] for a in data['topartists']['artist']]
-    except: pass
+        if 'topartists' in data:
+            return [a['name'] for a in data['topartists']['artist']]
+    except:
+        pass
     return []
 
 def get_artist_details(artist_name, api_key):
@@ -102,8 +111,10 @@ def get_artist_details(artist_name, api_key):
     try:
         response = requests.get(url, timeout=5)
         data = response.json()
-        if 'error' not in data: return data['artist']
-    except: pass
+        if 'error' not in data:
+            return data['artist']
+    except:
+        pass
     return None
 
 def get_top_tracks(artist_name, api_key):
@@ -111,8 +122,10 @@ def get_top_tracks(artist_name, api_key):
     try:
         response = requests.get(url, timeout=5)
         data = response.json()
-        if 'error' not in data: return data['toptracks']['track']
-    except: pass
+        if 'error' not in data:
+            return data['toptracks']['track']
+    except:
+        pass
     return []
 
 def get_deezer_data(artist_name):
@@ -123,10 +136,14 @@ def get_deezer_data(artist_name):
         if data.get('data'):
             artist = data['data'][0]
             return {
-                "name": artist['name'], "id": artist['id'], "listeners": artist['nb_fan'],
-                "image": artist['picture_medium'], "link": artist['link']
+                "name": artist['name'],
+                "id": artist['id'],
+                "listeners": artist['nb_fan'],
+                "image": artist['picture_medium'],
+                "link": artist['link']
             }
-    except: pass
+    except:
+        pass
     return None
 
 def get_deezer_preview(artist_id):
@@ -136,14 +153,19 @@ def get_deezer_preview(artist_id):
         data = response.json()
         if data.get('data') and len(data['data']) > 0:
             track = data['data'][0]
-            return { "title": track['title'], "preview": track['preview'] }
-    except: pass
+            return {
+                "title": track['title'],
+                "preview": track['preview']
+            }
+    except:
+        pass
     return None
 
 def process_artist(name, df_db, api_key):
     if not df_db.empty:
         match = df_db[df_db['Artist_Lower'] == name.strip().lower()]
-        if not match.empty: return match.iloc[0].to_dict()
+        if not match.empty:
+            return match.iloc[0].to_dict()
 
     deezer_info = get_deezer_data(name)
     clean_name = deezer_info['name'] if deezer_info else name
@@ -159,42 +181,26 @@ def process_artist(name, df_db, api_key):
 
         tags = [tag['name'].lower() for tag in lastfm_info['tags']['tag']]
         
-        # --- IMPROVED SCORING LOGIC (Valence Fix) ---
-        ENERGY_SCORES = {'death': 1.0, 'thrash': 0.95, 'core': 0.95, 'metal': 0.9, 'punk': 0.9, 'heavy': 0.9,
-                         'industrial': 0.85, 'hard rock': 0.8, 'hip hop': 0.75, 'rock': 0.7, 'electronic': 0.65, 'pop': 0.6, 'indie': 0.5, 'alternative': 0.5,
-                         'folk': 0.3, 'soul': 0.3, 'country': 0.4, 'jazz': 0.35, 'ambient': 0.1, 'acoustic': 0.2, 'classical': 0.15}
-        
-        VALENCE_SCORES = {
-            'happy': 0.9, 'party': 0.85, 'dance': 0.85, 'pop': 0.8, 'upbeat': 0.8,
-            'funk': 0.75, 'soul': 0.7, 'country': 0.6, 'folk': 0.5,
-            'progressive': 0.5,
-            'alternative': 0.4, 
-            'rock': 0.45,
-            'sad': 0.2, 'dark': 0.15, 'melancholic': 0.1, 'depressive': 0.05,
-            'doom': 0.1, 'gothic': 0.2, 
-            'industrial': 0.3, 'angry': 0.3, 
-            'metal': 0.3, 
-            'heavy': 0.3, 
-            'thrash': 0.2,
-            'death': 0.1
-        }
+        # VALENCE FIX: Expanded scoring dictionaries
+        ENERGY_SCORES = {'death': 1.0, 'thrash': 0.95, 'core': 0.95, 'metal': 0.9, 'punk': 0.9, 'heavy': 0.9, 'industrial': 0.85, 'hard rock': 0.8, 'hip hop': 0.75, 'rock': 0.7, 'electronic': 0.65, 'pop': 0.6, 'indie': 0.5, 'alternative': 0.5, 'folk': 0.3, 'soul': 0.3, 'country': 0.4, 'jazz': 0.35, 'ambient': 0.1, 'acoustic': 0.2, 'classical': 0.15}
+        VALENCE_SCORES = {'happy': 0.9, 'party': 0.9, 'dance': 0.85, 'pop': 0.8, 'upbeat': 0.8, 'funk': 0.75, 'soul': 0.7, 'country': 0.6, 'folk': 0.5, 'progressive': 0.5, 'alternative': 0.4, 'rock': 0.45, 'sad': 0.2, 'dark': 0.15, 'melancholic': 0.1, 'depressive': 0.05, 'doom': 0.1, 'gothic': 0.2, 'industrial': 0.3, 'angry': 0.3, 'metal': 0.3, 'heavy': 0.3, 'thrash': 0.2, 'death': 0.1}
 
         def calculate_score(tag_list, score_dict):
-            found_scores = []
-            for tag in tag_list:
-                for genre, score in score_dict.items():
-                    if genre in tag:
-                        found_scores.append(score)
-            if not found_scores: return 0.5
-            return sum(found_scores) / len(found_scores)
+            # FIXED: Explicitly defined score_dict is now used correctly
+            scores = [score for tag, score in score_dict.items() for t in tag_list if tag in t]
+            return sum(scores)/len(scores) if scores else 0.5
 
         energy = calculate_score(tags, ENERGY_SCORES)
         valence = calculate_score(tags, VALENCE_SCORES)
         main_genre = tags[0].title() if tags else "Unknown"
 
         new_data = {
-            "Artist": clean_name, "Genre": main_genre, "Monthly Listeners": final_listeners,
-            "Energy": energy, "Valence": valence, "Image URL": final_image
+            "Artist": clean_name,
+            "Genre": main_genre,
+            "Monthly Listeners": final_listeners,
+            "Energy": energy,
+            "Valence": valence,
+            "Image URL": final_image
         }
         
         save_artist(new_data)
@@ -261,12 +267,6 @@ with st.sidebar:
                 st.error(f"Search Error: {e}")
     
     st.divider()
-    if st.button("🔄 Reset / Show Global Galaxy"):
-        if 'view_df' in st.session_state: del st.session_state['view_df']
-        if 'center_node' in st.session_state: del st.session_state['center_node']
-        st.cache_data.clear()
-        st.rerun()
-
     if st.button("🎲 Random Jump"):
         if not df_db.empty:
             random_artist = df_db.sample(1).iloc[0]['Artist']
@@ -278,6 +278,8 @@ with st.sidebar:
                 st.rerun()
             except Exception as e:
                  st.error(f"Jump failed: {e}")
+        else:
+            st.warning("Database empty. Start your first search.")
 
     # --- SECURE ADMIN ZONE ---
     with st.expander("🔐 Admin Zone"):
@@ -287,7 +289,6 @@ with st.sidebar:
         is_authenticated = False
         if admin_pass:
             try:
-                # Robust check against stripped secret
                 input_clean = str(admin_pass).strip()
                 secret_clean = str(st.secrets["admin_password"]).strip()
                 if input_clean == secret_clean:
@@ -302,8 +303,8 @@ with st.sidebar:
             if not df_db.empty:
                 artist_to_delete = st.selectbox("Select Artist to Remove", options=df_db['Artist'].sort_values().unique(), key="del_sel")
                 
-                if st.button(f"🗑️ Delete {artist_to_delete}", type="primary"):
-                    with st.spinner("Deleting from Google Sheets..."):
+                if st.button(f"Delete {artist_to_delete}", type="primary"):
+                    with st.spinner("Deleting..."):
                         if delete_artist(artist_to_delete):
                             st.success(f"Deleted {artist_to_delete}!")
                             time.sleep(1)
@@ -312,19 +313,23 @@ with st.sidebar:
                         else:
                             st.error("Could not find artist in sheet.")
 
-# --- 7. THE VISUALIZATION ---
-# This is the Unified Graph View (Solar System or Global Cluster)
+# --- 7. THE SOLAR SYSTEM (GRAPH VIEW ONLY) ---
 
-if 'view_df' in st.session_state and not st.session_state.view_df.empty:
-    display_df = st.session_state.view_df
-    view_title = f"🔭 System: {st.session_state.center_node or st.session_state.get('search_query', 'Unknown')}"
-    is_global = False
-else:
-    display_df = df_db
-    view_title = "🌍 The Universal Galaxy"
-    is_global = True
+# View State Management
+if 'view_df' not in st.session_state or st.session_state.view_df.empty:
+    # Default State: Show a random sample to avoid empty screen
+    if not df_db.empty:
+        sample_size = min(len(df_db), 20)
+        st.session_state.view_df = df_db.sample(n=sample_size)
+        st.session_state.center_node = st.session_state.view_df.sort_values('Monthly Listeners', ascending=False).iloc[0]['Artist']
+    else:
+        st.session_state.view_df = pd.DataFrame()
+        st.session_state.center_node = None
 
-st.subheader(view_title)
+display_df = st.session_state.view_df
+center_node = st.session_state.get('center_node', 'Unknown')
+
+st.subheader(f"🔭 System: {center_node}")
 
 selected_artist = None
 
@@ -334,23 +339,31 @@ if not display_df.empty:
     added_node_ids = set() 
 
     real_center = None
-    center_node = st.session_state.get('center_node', None)
     if center_node:
         real_center = next((row['Artist'] for i, row in display_df.iterrows() if row['Artist'].lower() == str(center_node).lower()), None)
 
     for index, row in display_df.iterrows():
         if row['Artist'] in added_node_ids: continue
         
+        # Visuals: Size based on popularity
         size = 25
         if row['Monthly Listeners'] > 1000000: size = 40
         if row['Monthly Listeners'] > 10000000: size = 60
-        if real_center and row['Artist'] == real_center: size = 80
         
-        # Border Color = Energy (Heat)
-        energy = float(row['Energy'])
-        border_color = "#333333" # Default Grey
-        if energy > 0.75: border_color = "#ff4b4b" # Hot Red (High Intensity)
-        elif energy < 0.4: border_color = "#4b9eff" # Cool Blue (Low Intensity)
+        if real_center and row['Artist'] == real_center: 
+            size = 80 # Center Node is huge
+        
+        # Color the border based on energy
+        energy_val = float(row.get('Energy', 0.5))
+        valence_val = float(row.get('Valence', 0.5))
+        
+        # Simple color mapping: High Energy = Red/Orange, Low Energy = Blue/Green
+        if energy_val > 0.8:
+            border_color = "#E74C3C" # Red/High Energy
+        elif energy_val < 0.4:
+            border_color = "#2ECC71" # Green/Low Energy
+        else:
+            border_color = "#F1C40F" # Yellow/Neutral/Rock
 
         nodes.append(Node(
             id=row['Artist'],
@@ -358,56 +371,40 @@ if not display_df.empty:
             size=size,
             shape="circularImage",
             image=row['Image URL'],
-            # NEW TOOLTIP: Includes Energy/Valence for inspection
-            title=f"Genre: {row['Genre']}\nEnergy: {energy:.2f}\nMood: {row['Valence']:.2f}",
-            borderWidth=4, 
-            color={'border': border_color, 'background': '#1f273e'}
+            title=f"{row['Genre']} | {int(row['Monthly Listeners']):,} Fans\nE:{energy_val:.2f} | V:{valence_val:.2f}",
+            borderWidth=5,
+            color={"border": border_color}
         ))
         added_node_ids.add(row['Artist'])
-
-    if is_global:
-        # GLOBAL VIEW: Cluster by Genre
-        unique_genres = display_df['Genre'].unique()
-        for genre in unique_genres:
-            if f"g_{genre}" not in added_node_ids:
-                 # Genre node is a star
-                 nodes.append(Node(id=f"g_{genre}", label=genre, size=15, color="#f1c40f", shape="star"))
-                 added_node_ids.add(f"g_{genre}")
-
-        for index, row in display_df.iterrows():
-            if f"g_{row['Genre']}" in added_node_ids:
-                 edges.append(Edge(source=row['Artist'], target=f"g_{row['Genre']}", color="#888888", width=0.5))
-            
-    else:
-        # SEARCH VIEW: Connect to Center
-        if real_center:
-            for index, row in display_df.iterrows():
-                if row['Artist'] != real_center:
-                    edges.append(Edge(source=real_center, target=row['Artist'], color="#888888"))
+        
+        # Connect neighbors to the center
+        if real_center and row['Artist'] != real_center:
+            edges.append(Edge(source=real_center, target=row['Artist'], color="#555555"))
 
     config = Config(width="100%", height=600, directed=False, physics=True, hierarchical=False, nodeHighlightBehavior=True, highlightColor="#F7A7A6", collapsible=True)
+    
     selected_artist = agraph(nodes=nodes, edges=edges, config=config)
 
     # --- 8. THE DASHBOARD ---
-    if selected_artist and not selected_artist.startswith("g_"):
+    if selected_artist:
         st.divider()
+        
         col_title, col_btn = st.columns([3, 1])
         with col_title:
             st.header(f"🤿 Deep Dive: {selected_artist}")
         with col_btn:
-            if st.button(f"🔭 Center Map on {selected_artist}", type="primary"):
+            if st.button(f"🔭 Travel to {selected_artist}", type="primary"):
                 try:
                     api_key = st.secrets["lastfm_key"]
                     run_discovery_sequence(selected_artist, "Artist", api_key, df_db)
-                    st.rerun()
                 except Exception as e:
                     st.error(f"Warp failed: {e}")
 
         try:
             api_key = st.secrets["lastfm_key"]
             col1, col2 = st.columns([1, 2])
+            row = df_db[df_db['Artist'] == selected_artist]
             
-            row = display_df[display_df['Artist'] == selected_artist]
             image_url = None
             if not row.empty: image_url = row.iloc[0]['Image URL']
             
@@ -421,7 +418,7 @@ if not display_df.empty:
 
             with col1:
                 if image_url and str(image_url).startswith("http"):
-                    st.image(image_url, use_column_width=True)
+                    st.image(image_url)
                 
                 if audio_preview:
                     st.audio(audio_preview['preview'])
@@ -429,15 +426,14 @@ if not display_df.empty:
                 
                 if not row.empty:
                     st.metric("Fans", f"{int(row.iloc[0]['Monthly Listeners']):,}")
-                    st.write(f"**Genre:** {row.iloc[0]['Genre']}")
                     
-                    st.divider()
                     energy_val = float(row.iloc[0]['Energy'])
                     valence_val = float(row.iloc[0]['Valence'])
-
-                    st.caption(f"🔥 Intensity (Energy): {energy_val:.2f}")
+                    
+                    st.write(f"**Vibe Score:** {row.iloc[0]['Genre']}")
+                    st.caption(f"Energy (Intensity): {energy_val:.2f}")
                     st.progress(energy_val)
-                    st.caption(f"😊 Mood (Valence): {valence_val:.2f}")
+                    st.caption(f"Mood (Happiness): {valence_val:.2f}")
                     st.progress(valence_val)
 
             with col2:
@@ -453,7 +449,7 @@ if not display_df.empty:
                     st.dataframe(pd.DataFrame(track_data), column_config={"Play": st.column_config.LinkColumn("Link")}, hide_index=True, use_container_width=True)
 
         except Exception as e:
-            st.error(f"Data Error: {e}")
+            st.error(f"Could not load details. {e}")
 
 else:
     st.info("The database is empty! Use the sidebar to start your first search.")
