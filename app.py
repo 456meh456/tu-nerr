@@ -4,10 +4,11 @@ import altair as alt
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
+import time
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(layout="wide", page_title="tu-nerr")
-st.title("🎵 tu-nerr: The Live Music Map")
+st.title("🎵 tu-nerr: The Discovery Engine")
 
 # --- 1. GOOGLE SHEETS CONNECTION ---
 @st.cache_resource
@@ -34,10 +35,16 @@ def load_data():
     data = sheet.get_all_records()
     df = pd.DataFrame(data)
     
-    # FORCE NUMBERS: This fixes "invisible" dots caused by text formatting
+    # FORCE NUMBERS
     cols_to_fix = ['Monthly Listeners', 'Energy', 'Valence']
     for col in cols_to_fix:
         df[col] = pd.to_numeric(df[col], errors='coerce')
+    
+    # Create a lowercase column for easier searching
+    if not df.empty:
+        df['Artist_Lower'] = df['Artist'].str.strip().str.lower()
+    else:
+        df['Artist_Lower'] = []
     
     return df
 
@@ -55,6 +62,30 @@ def save_artist(artist_data):
     sheet.append_row(row)
 
 # --- 3. API FUNCTIONS ---
+def get_similar_artists(artist_name, api_key, limit=10):
+    """Fetches a list of similar artist names from Last.fm."""
+    url = f"http://ws.audioscrobbler.com/2.0/?method=artist.getsimilar&artist={artist_name}&api_key={api_key}&limit={limit}&format=json"
+    try:
+        response = requests.get(url)
+        data = response.json()
+        if 'similarartists' in data:
+            return [a['name'] for a in data['similarartists']['artist']]
+    except:
+        pass
+    return []
+
+def get_top_artists_by_genre(genre, api_key, limit=12):
+    """Fetches top artists for a specific tag/genre."""
+    url = f"http://ws.audioscrobbler.com/2.0/?method=tag.gettopartists&tag={genre}&api_key={api_key}&limit={limit}&format=json"
+    try:
+        response = requests.get(url)
+        data = response.json()
+        if 'topartists' in data:
+            return [a['name'] for a in data['topartists']['artist']]
+    except:
+        pass
+    return []
+
 def get_artist_details(artist_name, api_key):
     """Fetches Bio and Stats from Last.fm."""
     url = f"http://ws.audioscrobbler.com/2.0/?method=artist.getinfo&artist={artist_name}&api_key={api_key}&format=json"
@@ -83,13 +114,8 @@ def get_deezer_data(artist_name):
     """Fetches Name, Image, and Fan Count from Deezer."""
     try:
         url = f"https://api.deezer.com/search/artist?q={artist_name}"
-        
-        # FIX 1: verify=False helps if you are behind a corporate firewall/proxy
-        # FIX 2: A timeout prevents it from hanging forever
         response = requests.get(url, verify=False, timeout=5)
-        
         data = response.json()
-        
         if data.get('data'):
             artist = data['data'][0]
             return {
@@ -98,112 +124,151 @@ def get_deezer_data(artist_name):
                 "image": artist['picture_medium'],
                 "link": artist['link']
             }
-        else:
-            # Debug: Let us know if Deezer just couldn't find the band
-            st.warning(f"Deezer found no matches for '{artist_name}'")
-            
-    except Exception as e:
-        # Debug: Print the specific error to the dashboard so we can see it
-        st.error(f"Deezer API Error: {e}")
-        pass
-    return None
-
-def get_lastfm_data(artist_name, api_key):
-    url = f"http://ws.audioscrobbler.com/2.0/?method=artist.getinfo&artist={artist_name}&api_key={api_key}&format=json"
-    try:
-        response = requests.get(url)
-        data = response.json()
-        if 'error' not in data:
-            return data['artist']
     except:
         pass
     return None
 
-# --- 4. LOAD DATA ---
-if st.button("🔄 Refresh Data"):
-    st.cache_data.clear()
+def process_artist(name, df_db, api_key):
+    """Checks DB first, otherwise fetches from API and saves."""
+    # 1. Check DB
+    if not df_db.empty:
+        match = df_db[df_db['Artist_Lower'] == name.strip().lower()]
+        if not match.empty:
+            return match.iloc[0].to_dict()
 
+    # 2. Fetch New Data
+    deezer_info = get_deezer_data(name)
+    clean_name = deezer_info['name'] if deezer_info else name
+    lastfm_info = get_artist_details(clean_name, api_key)
+
+    if lastfm_info:
+        if deezer_info:
+            final_listeners = deezer_info['listeners']
+            final_image = deezer_info['image']
+        else:
+            final_listeners = int(lastfm_info['stats']['listeners'])
+            final_image = "https://commons.wikimedia.org/wiki/Special:FilePath/A_placeholder_box.svg"
+
+        tags = [tag['name'].lower() for tag in lastfm_info['tags']['tag']]
+        
+        # Scoring
+        ENERGY_SCORES = {'death metal': 1.0, 'thrash': 0.95, 'metalcore': 0.9, 'punk': 0.9, 'industrial': 0.85, 'hard rock': 0.8, 'hip hop': 0.75, 'rock': 0.7, 'electronic': 0.65, 'pop': 0.6, 'indie': 0.5, 'alternative': 0.5, 'folk': 0.3, 'soul': 0.3, 'country': 0.4, 'jazz': 0.35, 'ambient': 0.1, 'acoustic': 0.2, 'classical': 0.15}
+        VALENCE_SCORES = {'happy': 0.9, 'party': 0.9, 'dance': 0.85, 'pop': 0.8, 'upbeat': 0.8, 'funk': 0.75, 'soul': 0.7, 'country': 0.6, 'folk': 0.5, 'progressive': 0.45, 'alternative': 0.4, 'rock': 0.5, 'sad': 0.2, 'dark': 0.15, 'melancholic': 0.1, 'depressive': 0.05, 'doom': 0.1, 'gothic': 0.2, 'industrial': 0.3, 'angry': 0.2}
+
+        def calculate_score(tag_list, score_dict):
+            found_scores = []
+            for tag in tag_list:
+                for genre, score in score_dict.items():
+                    if genre in tag:
+                        found_scores.append(score)
+            if not found_scores: return 0.5
+            return sum(found_scores) / len(found_scores)
+
+        energy = calculate_score(tags, ENERGY_SCORES)
+        valence = calculate_score(tags, VALENCE_SCORES)
+        main_genre = tags[0].title() if tags else "Unknown"
+
+        new_data = {
+            "Artist": clean_name,
+            "Genre": main_genre,
+            "Monthly Listeners": final_listeners,
+            "Energy": energy,
+            "Valence": valence,
+            "Image URL": final_image
+        }
+        
+        save_artist(new_data)
+        return new_data
+    
+    return None
+
+# --- 4. LOAD DATA INITIAL ---
 try:
-    df = load_data()
+    df_db = load_data()
 except Exception as e:
-    st.error("Could not load data. Check your Google Sheet connection.")
+    st.error("Could not load data. Check secrets.")
     st.stop()
 
-# --- 5. SIDEBAR ---
+# --- 5. SIDEBAR: THE EXPLORER ---
 with st.sidebar:
-    st.header("🔭 Add to Database")
-    search_query = st.text_input("Type a band name:")
+    st.header("🚀 Exploration Engine")
     
-    if st.button("Map It!"):
+    search_mode = st.radio("Search By:", ["Artist", "Genre"])
+    search_query = st.text_input(f"Enter {search_mode} Name:")
+    
+    if st.button("Launch Discovery"):
         if search_query:
-            if not df.empty and search_query.lower() in df['Artist'].str.lower().values:
-                st.warning(f"⚠️ {search_query} is already on the map!")
+            try:
+                api_key = st.secrets["lastfm_key"]
+            except FileNotFoundError:
+                st.error("API Key missing!")
+                st.stop()
+
+            # 1. BUILD TARGET LIST
+            target_list = []
+            with st.spinner(f"Scanning the cosmos for {search_query}..."):
+                if search_mode == "Artist":
+                    target_list.append(search_query)
+                    # Get 10 neighbors
+                    similar = get_similar_artists(search_query, api_key, limit=10)
+                    target_list.extend(similar)
+                else:
+                    target_list = get_top_artists_by_genre(search_query, api_key, limit=12)
+
+            # 2. PROCESS BATCH
+            current_session_data = []
+            progress_bar = st.progress(0)
+            
+            for i, artist in enumerate(target_list):
+                progress_bar.progress((i + 1) / len(target_list))
+                data = process_artist(artist, df_db, api_key)
+                if data:
+                    current_session_data.append(data)
+                
+                # Refresh DB copy in memory occasionally
+                if i % 3 == 0:
+                    df_db = load_data() 
+
+            # 3. SAVE RESULTS TO SESSION STATE
+            if current_session_data:
+                st.session_state.view_df = pd.DataFrame(current_session_data)
+                st.session_state.center_node = search_query if search_mode == "Artist" else None
+                st.success(f"Discovery complete! Found {len(current_session_data)} artists.")
+                st.rerun()
             else:
-                try:
-                    api_key = st.secrets["lastfm_key"]
-                except FileNotFoundError:
-                    st.error("❌ API Key missing!")
-                    st.stop()
+                st.error("No data found. Try a different name.")
+    
+    st.divider()
+    if st.button("🔄 Reset / Show Global Map"):
+        if 'view_df' in st.session_state:
+            del st.session_state['view_df']
+        if 'center_node' in st.session_state:
+            del st.session_state['center_node']
+        st.cache_data.clear()
+        st.rerun()
 
-                with st.spinner(f"Hunting for {search_query}..."):
-                    deezer_info = get_deezer_data(search_query)
-                    clean_name = deezer_info['name'] if deezer_info else search_query
-                    lastfm_info = get_lastfm_data(clean_name, api_key)
+# --- 6. THE MAP (DYNAMIC VIEW) ---
 
-                    if lastfm_info:
-                        if deezer_info:
-                            final_listeners = deezer_info['listeners']
-                            final_image = deezer_info['image']
-                        else:
-                            final_listeners = int(lastfm_info['stats']['listeners'])
-                            final_image = "https://commons.wikimedia.org/wiki/Special:FilePath/A_placeholder_box.svg"
+# Logic: Are we looking at a search result, or the whole world?
+if 'view_df' in st.session_state and not st.session_state.view_df.empty:
+    display_df = st.session_state.view_df
+    view_title = f"🔭 Results for: {st.session_state.center_node or search_query}"
+else:
+    display_df = df_db
+    view_title = "🌍 Global Database View"
 
-                        tags = [tag['name'].lower() for tag in lastfm_info['tags']['tag']]
-                        
-                        ENERGY_SCORES = {'death metal': 1.0, 'thrash': 0.95, 'metalcore': 0.9, 'punk': 0.9, 'industrial': 0.85, 'hard rock': 0.8, 'hip hop': 0.75, 'rock': 0.7, 'electronic': 0.65, 'pop': 0.6, 'indie': 0.5, 'alternative': 0.5, 'folk': 0.3, 'soul': 0.3, 'country': 0.4, 'jazz': 0.35, 'ambient': 0.1, 'acoustic': 0.2, 'classical': 0.15}
-                        VALENCE_SCORES = {'happy': 0.9, 'party': 0.9, 'dance': 0.85, 'pop': 0.8, 'upbeat': 0.8, 'funk': 0.75, 'soul': 0.7, 'country': 0.6, 'folk': 0.5, 'progressive': 0.45, 'alternative': 0.4, 'rock': 0.5, 'sad': 0.2, 'dark': 0.15, 'melancholic': 0.1, 'depressive': 0.05, 'doom': 0.1, 'gothic': 0.2, 'industrial': 0.3, 'angry': 0.2}
+st.subheader(view_title)
 
-                        def calculate_score(tag_list, score_dict):
-                            found_scores = []
-                            for tag in tag_list:
-                                for genre, score in score_dict.items():
-                                    if genre in tag:
-                                        found_scores.append(score)
-                            if not found_scores: return 0.5
-                            return sum(found_scores) / len(found_scores)
-
-                        energy_score = calculate_score(tags, ENERGY_SCORES)
-                        valence_score = calculate_score(tags, VALENCE_SCORES)
-                        main_genre = tags[0].title() if tags else "Unknown"
-
-                        new_data = {
-                            "Artist": clean_name,
-                            "Genre": main_genre,
-                            "Monthly Listeners": final_listeners,
-                            "Energy": energy_score,
-                            "Valence": valence_score,
-                            "Image URL": final_image
-                        }
-                        
-                        save_artist(new_data)
-                        st.success(f"✅ Saved {clean_name} to the database!")
-                        st.cache_data.clear()
-                        st.rerun()
-                    else:
-                        st.error("❌ Band not found on Last.fm.")
-
-# --- 6. THE MAP ---
-st.subheader("The Live Landscape")
-
-if not df.empty:
+if not display_df.empty:
+    # Selection Logic
     selection = alt.selection_point(name="SelectArtist", fields=['Artist'], on='click', empty=False)
     
     base_colors = ['#e91e63', '#9b59b6', '#2e86c1', '#1abc9c', '#f1c40f', '#e67e22', '#e74c3c', '#34495e', '#7f8c8d', '#27ae60', '#2980b9', '#8e44ad', '#c0392b', '#d35400']
 
-    chart = alt.Chart(df).mark_circle(opacity=0.6, stroke='black', strokeWidth=1).encode(
+    chart = alt.Chart(display_df).mark_circle(stroke='black', strokeWidth=1).encode(
         x=alt.X('Valence', scale=alt.Scale(domain=[0, 1])),
         y=alt.Y('Energy', scale=alt.Scale(domain=[0, 1])),
-        size=alt.Size('Monthly Listeners', scale=alt.Scale(range=[50, 1000]), legend=None),
+        size=alt.Size('Monthly Listeners', scale=alt.Scale(range=[100, 1000]), legend=None),
         color=alt.Color('Genre', scale=alt.Scale(range=base_colors), legend=None),
         tooltip=['Artist', 'Genre', 'Monthly Listeners'],
         opacity=alt.condition(selection, alt.value(1), alt.value(0.2))
@@ -213,7 +278,6 @@ if not df.empty:
 
     # --- 7. THE DASHBOARD ---
     selected_artist = None
-    
     if event.selection and "SelectArtist" in event.selection:
         selection_data = event.selection["SelectArtist"]
         if isinstance(selection_data, list) and len(selection_data) > 0:
@@ -229,58 +293,46 @@ if not df.empty:
             api_key = st.secrets["lastfm_key"]
             col1, col2 = st.columns([1, 2])
             
-            with st.spinner(f"Fetching secret intel on {selected_artist}..."):
-                # 1. Last.fm Data
-                details = get_artist_details(selected_artist, api_key)
-                tracks = get_top_tracks(selected_artist, api_key)
-                
-                # 2. Deezer Data (LIVE FETCH for fresh image)
-                deezer_live = get_deezer_data(selected_artist)
-
-            if details:
-                # Decide which image to use (Deezer > Database)
+            # Grab image from the display_df (since we already have it there)
+            row = display_df[display_df['Artist'] == selected_artist]
+            if not row.empty:
+                image_url = row.iloc[0]['Image URL']
+            else:
                 image_url = None
-                if deezer_live and deezer_live.get('image'):
-                    image_url = deezer_live['image']
-                else:
-                    # Fallback to DB if Deezer fails
-                    artist_row = df[df['Artist'] == selected_artist].iloc[0]
-                    image_url = artist_row.get('Image URL')
 
-                with col1:
-                    if image_url and str(image_url).startswith("http"):
-                        st.image(image_url)
-                    
+            with col1:
+                if image_url and str(image_url).startswith("http"):
+                    st.image(image_url)
+                
+                # Only fetch details if we don't have them (or to get fresh stats)
+                with st.spinner("Fetching details..."):
+                    details = get_artist_details(selected_artist, api_key)
+                
+                if details:
                     listeners_fmt = int(details['stats']['listeners'])
                     st.metric("Last.fm Listeners", f"{listeners_fmt:,}")
-                    
                     tags = [t['name'] for t in details['tags']['tag']]
                     st.write(f"**Style:** {', '.join(tags[:3])}")
-                    
-                    bio_summary = details['bio']['summary'].split("<a href")[0] 
-                    st.info(bio_summary)
+                    st.info(details['bio']['summary'].split("<a href")[0])
 
-                with col2:
-                    st.subheader("🔥 Top Tracks")
-                    track_data = []
-                    for t in tracks:
-                        track_data.append({
-                            "Song": t['name'],
-                            "Playcount": f"{int(t['playcount']):,}",
-                            "Link": t['url']
-                        })
-                    
-                    st.dataframe(
-                        pd.DataFrame(track_data),
-                        column_config={"Link": st.column_config.LinkColumn("Listen")},
-                        hide_index=True,
-                        use_container_width=True
-                    )
+            with col2:
+                with st.spinner("Fetching top tracks..."):
+                    tracks = get_top_tracks(selected_artist, api_key)
+                
+                track_data = [{"Song": t['name'], "Playcount": f"{int(t['playcount']):,}", "Link": t['url']} for t in tracks]
+                
+                st.dataframe(
+                    pd.DataFrame(track_data),
+                    column_config={"Link": st.column_config.LinkColumn("Listen")},
+                    hide_index=True,
+                    use_container_width=True
+                )
         except Exception as e:
             st.error(f"Could not load details. {e}")
 
+    # Optional: View raw data
     with st.expander("View Database"):
-        st.dataframe(df)
+        st.dataframe(display_df)
 
 else:
-    st.info("The database is empty! Use the sidebar to add the first band.")
+    st.info("The database is empty! Use the sidebar to start your first search.")
