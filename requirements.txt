@@ -4,3 +4,4 @@ altair
 requests
 gspread
 google-auth
+streamlit-agraph
