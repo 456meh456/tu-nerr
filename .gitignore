@@ -1,0 +1,17 @@
+Secrets (NEVER upload these)
+
+.streamlit/secrets.toml
+client_secret_.json
+tu-nerr-bot-.json
+
+System files
+
+pycache/
+*.pyc
+.DS_Store
+
+Virtual Environments
+
+.venv/
+env/
+venv/
