@@ -4,6 +4,7 @@ import requests
 import gspread
 from google.oauth2.service_account import Credentials
 from streamlit_agraph import agraph, Node, Edge, Config
+import plotly.express as px 
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(layout="wide", page_title="tu-nerr")
@@ -12,6 +13,7 @@ st.title("🎵 tu-nerr: The Discovery Engine")
 # --- 1. GOOGLE SHEETS CONNECTION ---
 @st.cache_resource
 def get_sheet_connection():
+    """Connects to Google Sheets using secrets."""
     scope = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive"
@@ -28,30 +30,24 @@ def get_sheet_connection():
 
 # --- 2. DATA FUNCTIONS ---
 def load_data():
-    """Fetches, cleans, and deduplicates data."""
+    """Fetches all data from the Google Sheet."""
     sheet = get_sheet_connection()
     data = sheet.get_all_records()
     df = pd.DataFrame(data)
-    
-    # 1. Force Numbers
     cols_to_fix = ['Monthly Listeners', 'Energy', 'Valence']
     for col in cols_to_fix:
         df[col] = pd.to_numeric(df[col], errors='coerce')
-    
-    # 2. Clean Strings (Remove empty rows and whitespace)
-    if not df.empty and 'Artist' in df.columns:
-        df['Artist'] = df['Artist'].astype(str).str.strip()
-        df = df[df['Artist'].str.len() > 0]
-        # Normalize for matching
-        df['Artist_Lower'] = df['Artist'].str.lower()
-        # Deduplicate
-        df = df.drop_duplicates(subset=['Artist_Lower'], keep='first')
+    if not df.empty:
+        df['Artist_Lower'] = df['Artist'].str.strip().str.lower()
+        # Create a Log scale for Z-Axis
+        import numpy as np
+        df['Log_Listeners'] = np.log10(df['Monthly Listeners'].replace(0, 1))
     else:
-        df = pd.DataFrame(columns=['Artist', 'Genre', 'Monthly Listeners', 'Energy', 'Valence', 'Image URL', 'Artist_Lower'])
-        
+        df['Artist_Lower'] = []
     return df
 
 def save_artist(artist_data):
+    """Appends a new artist row to the Google Sheet."""
     sheet = get_sheet_connection()
     row = [
         artist_data['Artist'],
@@ -126,13 +122,11 @@ def get_deezer_data(artist_name):
     return None
 
 def process_artist(name, df_db, api_key):
-    # 1. Check DB first (Case insensitive)
     if not df_db.empty:
         match = df_db[df_db['Artist_Lower'] == name.strip().lower()]
         if not match.empty:
             return match.iloc[0].to_dict()
 
-    # 2. Fetch New Data
     deezer_info = get_deezer_data(name)
     clean_name = deezer_info['name'] if deezer_info else name
     lastfm_info = get_artist_details(clean_name, api_key)
@@ -177,14 +171,47 @@ def process_artist(name, df_db, api_key):
     
     return None
 
-# --- 4. LOAD DATA INITIAL ---
+# --- 4. REUSABLE DISCOVERY ENGINE (RESTORED!) ---
+def run_discovery_sequence(center_entity, mode, api_key, df_db):
+    """Central logic for finding and mapping clusters."""
+    target_list = []
+    
+    with st.spinner(f"Scanning the cosmos for {center_entity}..."):
+        if mode == "Artist":
+            target_list.append(center_entity)
+            similar = get_similar_artists(center_entity, api_key, limit=10)
+            target_list.extend(similar)
+        else:
+            target_list = get_top_artists_by_genre(center_entity, api_key, limit=12)
+    
+    target_list = list(set(target_list))
+
+    current_session_data = []
+    progress_bar = st.progress(0)
+    
+    for i, artist in enumerate(target_list):
+        progress_bar.progress((i + 1) / len(target_list))
+        data = process_artist(artist, df_db, api_key)
+        if data:
+            current_session_data.append(data)
+        # Refresh DB copy occasionally
+        if i % 3 == 0: df_db = load_data() 
+
+    if current_session_data:
+        session_df = pd.DataFrame(current_session_data).drop_duplicates(subset=['Artist'])
+        st.session_state.view_df = session_df
+        st.session_state.center_node = center_entity if mode == "Artist" else None
+        return True
+    return False
+
+# --- 5. LOAD DATA INITIAL ---
 try:
     df_db = load_data()
 except Exception as e:
     st.error("Could not load data. Check secrets.")
     st.stop()
 
-# --- 5. SIDEBAR ---
+# --- 6. SIDEBAR: THE EXPLORER ---
 with st.sidebar:
     st.header("🚀 Discovery Engine")
     
@@ -201,79 +228,35 @@ with st.sidebar:
                 st.error("API Key missing!")
                 st.stop()
 
-            target_list = []
-            with st.spinner(f"Scanning the cosmos for {search_query}..."):
-                if search_mode == "Artist":
-                    target_list.append(search_query)
-                    similar = get_similar_artists(search_query, api_key, limit=10)
-                    target_list.extend(similar)
-                else:
-                    target_list = get_top_artists_by_genre(search_query, api_key, limit=12)
-            
-            target_list = list(set(target_list))
-
-            current_session_data = []
-            progress_bar = st.progress(0)
-            
-            for i, artist in enumerate(target_list):
-                progress_bar.progress((i + 1) / len(target_list))
-                data = process_artist(artist, df_db, api_key)
-                if data:
-                    current_session_data.append(data)
-                if i % 3 == 0: df_db = load_data() 
-
-            if current_session_data:
-                session_df = pd.DataFrame(current_session_data).drop_duplicates(subset=['Artist'])
-                st.session_state.view_df = session_df
-                st.session_state.center_node = search_query if search_mode == "Artist" else None
-                st.success(f"Discovery complete! Found {len(session_df)} artists.")
+            success = run_discovery_sequence(search_query, search_mode, api_key, df_db)
+            if success:
+                st.success(f"Discovery complete!")
                 st.rerun()
             else:
                 st.error("No data found.")
     
     st.divider()
-    if st.button("🔄 Reset / Show Random Sample"):
+    if st.button("🔄 Reset / Show Global Galaxy"):
         if 'view_df' in st.session_state: del st.session_state['view_df']
         if 'center_node' in st.session_state: del st.session_state['center_node']
         st.cache_data.clear()
         st.rerun()
 
-# --- 6. THE SOLAR SYSTEM (GRAPH VIEW) ---
+# --- 7. VISUALIZATION (HYBRID VIEW) ---
 
-# View Logic:
-# 1. Search Results (Highest Priority)
-# 2. Random Sample (Default / "Safe State")
-# 3. Empty State (If DB is new)
+selected_artist = None
 
-is_global = False
+# LOGIC: If we are in "Search Mode", show the Solar System Graph.
 if 'view_df' in st.session_state and not st.session_state.view_df.empty:
+    st.subheader(f"🔭 System: {st.session_state.center_node or search_query}")
     display_df = st.session_state.view_df
-    view_title = f"🔭 System: {st.session_state.center_node or search_query}"
-elif not df_db.empty:
-    # SAFE DEFAULT: Pick 20 random bands so the graph isn't empty
-    sample_size = min(len(df_db), 20)
-    display_df = df_db.sample(n=sample_size)
-    view_title = "🎲 Random Discovery Sample"
-    is_global = True
-else:
-    display_df = pd.DataFrame()
-    view_title = "Waiting for data..."
-
-st.subheader(view_title)
-
-if not display_df.empty:
     
     nodes = []
     edges = []
-    added_node_ids = set() # Track Artist IDs
-    added_genre_ids = set() # Track Genre IDs (Separately)
+    added_node_ids = set() 
 
-    # 1. Create Artist Nodes
     for index, row in display_df.iterrows():
-        # Duplicate Guard
-        if row['Artist'] in added_node_ids:
-            continue
-            
+        if row['Artist'] in added_node_ids: continue
         size = 25
         if row['Monthly Listeners'] > 1000000: size = 40
         if row['Monthly Listeners'] > 10000000: size = 60
@@ -282,97 +265,96 @@ if not display_df.empty:
             if row['Artist'].lower() == st.session_state.center_node.lower():
                 size = 100
         
-        nodes.append(Node(
-            id=row['Artist'], # ID matches the Artist Name exactly
-            label=row['Artist'],
-            size=size,
-            shape="circularImage",
-            image=row['Image URL'],
-            title=f"{row['Genre']} | {int(row['Monthly Listeners']):,} Fans"
-        ))
+        tooltip_text = f"Genre: {row['Genre']}\nFans: {int(row['Monthly Listeners']):,}\nEnergy: {row['Energy']:.2f}\nMood: {row['Valence']:.2f}"
+        nodes.append(Node(id=row['Artist'], label=row['Artist'], size=size, shape="circularImage", image=row['Image URL'], title=tooltip_text))
         added_node_ids.add(row['Artist'])
 
-    # 2. Create Edges
-    if is_global:
-        # Connect Artists to Genres (Cluster View)
-        for index, row in display_df.iterrows():
-            genre_id = f"genre_{row['Genre']}" # NAMESPACE FIX: "genre_Rock" vs "Rock"
-            
-            # Add Genre Node if new
-            if genre_id not in added_genre_ids:
-                nodes.append(Node(id=genre_id, label=row['Genre'], size=10, color="#555555", shape="dot"))
-                added_genre_ids.add(genre_id)
-            
-            # Link Artist to Genre
-            edges.append(Edge(source=row['Artist'], target=genre_id, color="#333333"))
-            
-    else:
-        # Star Topology (Search View)
-        center = st.session_state.center_node
-        if center:
-            # Find the exact casing of the center node
-            real_center_name = next((row['Artist'] for i, row in display_df.iterrows() if row['Artist'].lower() == center.lower()), None)
-            
-            if real_center_name:
-                for index, row in display_df.iterrows():
-                    if row['Artist'] != real_center_name:
-                        edges.append(Edge(source=real_center_name, target=row['Artist'], color="#888888"))
+    center = st.session_state.center_node
+    if center:
+        real_center_name = next((row['Artist'] for i, row in display_df.iterrows() if row['Artist'].lower() == center.lower()), None)
+        if real_center_name:
+            for index, row in display_df.iterrows():
+                if row['Artist'] != real_center_name:
+                    edges.append(Edge(source=real_center_name, target=row['Artist'], color="#888888"))
 
-    config = Config(
-        width="100%",
-        height=600,
-        directed=False, 
-        physics=True, 
-        hierarchical=False,
-        nodeHighlightBehavior=True,
-        highlightColor="#F7A7A6",
-        collapsible=True
-    )
-
+    config = Config(width="100%", height=600, directed=False, physics=True, hierarchical=False, nodeHighlightBehavior=True, highlightColor="#F7A7A6", collapsible=True)
     selected_artist = agraph(nodes=nodes, edges=edges, config=config)
 
-    # --- 7. THE DASHBOARD ---
-    if selected_artist and not selected_artist.startswith("genre_"):
-        st.divider()
-        st.header(f"🤿 Deep Dive: {selected_artist}")
-
-        try:
-            api_key = st.secrets["lastfm_key"]
-            col1, col2 = st.columns([1, 2])
-            
-            # Check DB first for image
-            row = df_db[df_db['Artist'] == selected_artist]
-            
-            # Live fetch for fresh image if DB is missing/placeholder
-            image_url = None
-            if not row.empty:
-                image_url = row.iloc[0]['Image URL']
-            
-            if not image_url or "placeholder" in str(image_url):
-                 live_deezer = get_deezer_data(selected_artist)
-                 if live_deezer: image_url = live_deezer['image']
-
-            with col1:
-                if image_url and str(image_url).startswith("http"):
-                    st.image(image_url)
-                
-                if not row.empty:
-                    st.metric("Monthly Listeners", f"{int(row.iloc[0]['Monthly Listeners']):,}")
-                    st.write(f"**Genre:** {row.iloc[0]['Genre']}")
-
-            with col2:
-                with st.spinner("Fetching tracks..."):
-                    details = get_artist_details(selected_artist, api_key)
-                    tracks = get_top_tracks(selected_artist, api_key)
-
-                if details and 'bio' in details:
-                     st.info(details['bio']['summary'].split("<a href")[0])
-                
-                track_data = [{"Song": t['name'], "Playcount": f"{int(t['playcount']):,}", "Link": t['url']} for t in tracks]
-                st.dataframe(pd.DataFrame(track_data), column_config={"Link": st.column_config.LinkColumn("Listen")}, hide_index=True, use_container_width=True)
-
-        except Exception as e:
-            st.error(f"Could not load details. {e}")
-
 else:
-    st.info("The database is empty! Use the sidebar to start your first search.")
+    # --- VIEW B: GLOBAL GALAXY (3D SCATTER) ---
+    st.subheader("🌍 The Universal Galaxy")
+    
+    if not df_db.empty:
+        fig = px.scatter_3d(
+            df_db,
+            x='Valence',
+            y='Energy',
+            z='Log_Listeners', 
+            color='Genre',
+            hover_name='Artist',
+            hover_data=['Monthly Listeners', 'Genre'],
+            size='Monthly Listeners',
+            size_max=50,
+            opacity=0.8,
+            template="plotly_dark",
+            height=700
+        )
+        fig.update_layout(scene=dict(xaxis_title='Sad ⟵ Mood ⟶ Happy', yaxis_title='Mellow ⟵ Intensity ⟶ Heavy', zaxis_title='Underground ⟵ Fame ⟶ Mainstream'), margin=dict(l=0, r=0, b=0, t=0))
+        
+        event = st.plotly_chart(fig, use_container_width=True, on_select="rerun", selection_mode="points")
+        
+        if len(event.selection["points"]) > 0:
+            point_index = event.selection["points"][0]["point_index"]
+            selected_artist = df_db.iloc[point_index]["Artist"]
+    else:
+        st.info("Database empty.")
+
+# --- 8. THE DASHBOARD ---
+if selected_artist and not selected_artist.startswith("genre_"):
+    st.divider()
+    col_title, col_btn = st.columns([3, 1])
+    with col_title:
+        st.header(f"🤿 Deep Dive: {selected_artist}")
+    with col_btn:
+        if st.button(f"🔭 Center Map on {selected_artist}"):
+            try:
+                api_key = st.secrets["lastfm_key"]
+                run_discovery_sequence(selected_artist, "Artist", api_key, df_db)
+            except Exception as e:
+                st.error(f"Error: {e}")
+
+    try:
+        api_key = st.secrets["lastfm_key"]
+        col1, col2 = st.columns([1, 2])
+        row = df_db[df_db['Artist'] == selected_artist]
+        image_url = None
+        if not row.empty: image_url = row.iloc[0]['Image URL']
+        
+        if not image_url or "placeholder" in str(image_url):
+                live_deezer = get_deezer_data(selected_artist)
+                if live_deezer: image_url = live_deezer['image']
+
+        with col1:
+            if image_url and str(image_url).startswith("http"):
+                st.image(image_url)
+            if not row.empty:
+                st.metric("Monthly Listeners", f"{int(row.iloc[0]['Monthly Listeners']):,}")
+                st.write(f"**Genre:** {row.iloc[0]['Genre']}")
+                st.caption(f"Energy: {float(row.iloc[0]['Energy']):.2f}")
+                st.progress(float(row.iloc[0]['Energy']))
+                st.caption(f"Mood: {float(row.iloc[0]['Valence']):.2f}")
+                st.progress(float(row.iloc[0]['Valence']))
+
+        with col2:
+            with st.spinner("Fetching tracks..."):
+                details = get_artist_details(selected_artist, api_key)
+                tracks = get_top_tracks(selected_artist, api_key)
+
+            if details and 'bio' in details:
+                    st.info(details['bio']['summary'].split("<a href")[0])
+            
+            track_data = [{"Song": t['name'], "Playcount": f"{int(t['playcount']):,}", "Link": t['url']} for t in tracks]
+            st.dataframe(pd.DataFrame(track_data), column_config={"Link": st.column_config.LinkColumn("Listen")}, hide_index=True, use_container_width=True)
+
+    except Exception as e:
+        st.error(f"Could not load details. {e}")
