@@ -6,7 +6,6 @@ import urllib3
 import time
 from google.oauth2.service_account import Credentials
 from streamlit_agraph import agraph, Node, Edge, Config
-import random 
 import json
 # ML Imports
 from sklearn.preprocessing import StandardScaler
@@ -213,23 +212,8 @@ def process_artist(name, df_db, api_key):
 
         tags = [tag['name'].lower() for tag in lastfm_info['tags']['tag']]
         
-        # VALENCE FIX: Expanded scoring dictionaries for nuanced mood/energy
-        ENERGY_SCORES = {'death': 1.0, 'thrash': 0.95, 'core': 0.95, 'metal': 0.9, 'punk': 0.9, 'heavy': 0.9,
-                         'industrial': 0.85, 'hard rock': 0.8, 'hip hop': 0.75, 'rock': 0.7, 'electronic': 0.65, 'pop': 0.6, 'indie': 0.5, 'alternative': 0.5,
-                         'folk': 0.3, 'soul': 0.3, 'country': 0.4, 'jazz': 0.35, 'ambient': 0.1, 'acoustic': 0.2, 'classical': 0.15}
-        VALENCE_SCORES = {'happy': 0.9, 'party': 0.9, 'dance': 0.85, 'pop': 0.8, 'upbeat': 0.8,
-            'funk': 0.75, 'soul': 0.7, 'country': 0.6, 'folk': 0.5,
-            'progressive': 0.5,
-            'alternative': 0.4, 
-            'rock': 0.45,
-            'sad': 0.2, 'dark': 0.15, 'melancholic': 0.1, 'depressive': 0.05,
-            'doom': 0.1, 'gothic': 0.2, 
-            'industrial': 0.3, 'angry': 0.3, 
-            'metal': 0.3, 
-            'heavy': 0.3, 
-            'thrash': 0.2,
-            'death': 0.1
-        }
+        ENERGY_SCORES = {'death': 1.0, 'thrash': 0.95, 'core': 0.95, 'metal': 0.9, 'punk': 0.9, 'heavy': 0.9, 'industrial': 0.85, 'hard rock': 0.8, 'hip hop': 0.75, 'rock': 0.7, 'electronic': 0.65, 'pop': 0.6, 'indie': 0.5, 'folk': 0.3, 'soul': 0.3, 'country': 0.4, 'jazz': 0.35, 'ambient': 0.1, 'acoustic': 0.2, 'classical': 0.15}
+        VALENCE_SCORES = {'happy': 0.9, 'party': 0.9, 'dance': 0.85, 'pop': 0.8, 'upbeat': 0.8, 'funk': 0.75, 'soul': 0.7, 'country': 0.6, 'folk': 0.5, 'progressive': 0.5, 'rock': 0.45, 'sad': 0.2, 'dark': 0.15, 'doom': 0.1, 'gothic': 0.2, 'industrial': 0.3, 'angry': 0.3, 'metal': 0.3, 'heavy': 0.3, 'thrash': 0.2, 'death': 0.1}
 
         def calculate_score(tag_list, score_dict):
             scores = [score for tag, score in score_dict.items() for t in tag_list if tag in t]
@@ -243,10 +227,8 @@ def process_artist(name, df_db, api_key):
             "Artist": clean_name, "Genre": main_genre, "Monthly Listeners": final_listeners,
             "Energy": energy, "Valence": valence, "Image URL": final_image
         }
-        
         save_artist(new_data)
         return new_data
-    
     return None
 
 # --- 5. DISCOVERY LOGIC ---
@@ -276,8 +258,7 @@ def run_discovery(center, mode, api_key, df_db):
 # --- 6. INITIAL LOAD ---
 try:
     df_db = load_data()
-except Exception as e:
-    st.error(f"Startup Error: {e}")
+except:
     st.stop()
 
 # --- 7. SIDEBAR ---
@@ -288,11 +269,9 @@ with st.sidebar:
         query = st.text_input(f"Enter {mode} Name:")
         if st.form_submit_button("Launch"):
             if query:
-                try:
-                    key = st.secrets["lastfm_key"]
-                    if run_discovery(query, mode, key, df_db): st.rerun()
-                    else: st.error("No data found.")
-                except Exception as e: st.error(f"Search error: {e}")
+                if run_discovery(query, mode, st.secrets["lastfm_key"], df_db):
+                    st.rerun()
+                else: st.error("No data found.")
     
     st.divider()
     if st.button("🔄 Reset Map"):
@@ -304,16 +283,14 @@ with st.sidebar:
     with st.expander("🔐 Admin"):
         pw = st.text_input("Password:", type="password")
         if pw and pw == st.secrets.get("admin_password", ""):
-            if not df_db.empty:
-                artist_del = st.selectbox("Delete Artist", df_db['Artist'].sort_values().unique())
-                if st.button("Delete"):
-                    delete_artist(artist_del)
-                    st.cache_data.clear()
-                    st.rerun()
+            artist_del = st.selectbox("Delete Artist", df_db['Artist'].sort_values().unique() if not df_db.empty else [])
+            if st.button("Delete"):
+                delete_artist(artist_del)
+                st.cache_data.clear()
+                st.rerun()
 
 # --- 8. VISUALIZATION ---
 if 'view_df' not in st.session_state or st.session_state.view_df.empty:
-    # Show random sample if no search active
     if not df_db.empty:
         st.session_state.view_df = df_db.sample(min(len(df_db), 20))
         st.session_state.center_node = st.session_state.view_df.sort_values('Monthly Listeners', ascending=False).iloc[0]['Artist']
@@ -327,8 +304,6 @@ st.subheader(f"🔭 System: {center}")
 selected = None
 if not disp_df.empty:
     nodes, edges, added = [], [], set()
-    
-    # Find real center name
     real_center = next((r['Artist'] for i, r in disp_df.iterrows() if str(r['Artist']).lower() == str(center).lower()), None)
 
     for i, r in disp_df.iterrows():
@@ -345,8 +320,7 @@ if not disp_df.empty:
                           title=f"{r['Genre']}\nE:{r['Energy']:.2f} V:{r['Valence']:.2f}", borderWidth=4, color={'border': border}))
         added.add(r['Artist'])
 
-    # Global vs Search Topology
-    if not real_center and not disp_df.empty:
+    if not real_center and not disp_df.empty: 
         genres = disp_df['Genre'].unique()
         for g in genres:
             if f"g_{g}" not in added:
@@ -368,12 +342,11 @@ if selected and not selected.startswith("g_"):
     c1, c2 = st.columns([3, 1])
     with c1: st.header(f"🤿 {selected}")
     with c2:
-        # TRAVEL BUTTON
-        if st.button(f"🔭 Travel Here", type="primary"):
+        if st.button("🔭 Travel Here", type="primary"):
             run_discovery(selected, "Artist", st.secrets["lastfm_key"], df_db)
             st.rerun()
-            
-        # AI BUTTON (New!)
+        
+        # AI BUTTON
         if st.button("🤖 AI Neighbors"):
             ai_recs = get_ai_neighbors(selected, df_db)
             if not ai_recs.empty:
@@ -388,9 +361,8 @@ if selected and not selected.startswith("g_"):
         row = df_db[df_db['Artist'] == selected]
         img = row.iloc[0]['Image URL'] if not row.empty else None
         
-        # Live fetch check
         d_live = get_deezer_data(selected)
-        if not img or "placeholder" in str(img): # FIXED: changed str(image_url) to str(img)
+        if not img or "placeholder" in str(img): 
             if d_live: img = d_live['image']
             
         preview = None
