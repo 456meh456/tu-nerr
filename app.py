@@ -53,19 +53,46 @@ with st.sidebar:
                     listeners = int(artist['stats']['listeners'])
                     tags = [tag['name'].lower() for tag in artist['tags']['tag']]
                     
-                    # LOGIC: Guess Energy/Valence from tags
-                    energy_score = 0.5
-                    valence_score = 0.5
+                    # --- 🧠 BRAIN UPGRADE: Weighted Scoring System ---
                     
-                    # (Simplified keywords for the web app)
-                    ENERGY_WORDS = {'metal': 0.9, 'punk': 0.9, 'rock': 0.7, 'pop': 0.6, 'acoustic': 0.2}
-                    VALENCE_WORDS = {'happy': 0.9, 'party': 0.9, 'sad': 0.2, 'dark': 0.1}
+                    # 1. Define Dictionaries with Weights (0.0 to 1.0)
+                    # This tells the bot exactly "how heavy" or "how happy" a genre is.
+                    ENERGY_SCORES = {
+                        'death metal': 1.0, 'thrash': 0.95, 'metalcore': 0.9, 'punk': 0.9, 
+                        'industrial': 0.85, 'hard rock': 0.8, 'hip hop': 0.75, 'rock': 0.7, 
+                        'electronic': 0.65, 'pop': 0.6, 'indie': 0.5, 'alternative': 0.5,
+                        'folk': 0.3, 'soul': 0.3, 'country': 0.4, 'jazz': 0.35,
+                        'ambient': 0.1, 'acoustic': 0.2, 'classical': 0.15
+                    }
 
-                    matches_e = [s for t, s in ENERGY_WORDS.items() if any(t in tag for tag in tags)]
-                    if matches_e: energy_score = sum(matches_e)/len(matches_e)
-                    
-                    matches_v = [s for t, s in VALENCE_WORDS.items() if any(t in tag for tag in tags)]
-                    if matches_v: valence_score = sum(matches_v)/len(matches_v)
+                    VALENCE_SCORES = {
+                        'happy': 0.9, 'party': 0.9, 'dance': 0.85, 'pop': 0.8, 'upbeat': 0.8,
+                        'funk': 0.75, 'soul': 0.7, 'country': 0.6, 'folk': 0.5,
+                        'progressive': 0.45, 'alternative': 0.4, 'rock': 0.5,
+                        'sad': 0.2, 'dark': 0.15, 'melancholic': 0.1, 'depressive': 0.05,
+                        'doom': 0.1, 'gothic': 0.2, 'industrial': 0.3, 'angry': 0.2
+                    }
+
+                    def calculate_score(tag_list, score_dict):
+                        """Finds all matching tags and averages their scores."""
+                        found_scores = []
+                        for tag in tag_list:
+                            # Check if our known genres are inside the Last.fm tag
+                            # e.g., if tag is "progressive metal", it catches "metal" (0.9)
+                            for genre, score in score_dict.items():
+                                if genre in tag:
+                                    found_scores.append(score)
+                        
+                        if not found_scores:
+                            return 0.5  # Default to neutral if no tags match
+                        
+                        return sum(found_scores) / len(found_scores)
+
+                    # 2. Run the Calculation
+                    energy_score = calculate_score(tags, ENERGY_SCORES)
+                    valence_score = calculate_score(tags, VALENCE_SCORES)
+
+                    # -------------------------------------------------------
 
                     # CREATE NEW ROW
                     new_entry = pd.DataFrame([{
@@ -74,13 +101,13 @@ with st.sidebar:
                         "Monthly Listeners": listeners,
                         "Energy": energy_score,
                         "Valence": valence_score,
-                        "Image URL": "https://commons.wikimedia.org/wiki/Special:FilePath/A_placeholder_box.svg" # Placeholder
+                        "Image URL": "https://commons.wikimedia.org/wiki/Special:FilePath/A_placeholder_box.svg"
                     }])
                     
-                    # ADD TO SESSION STATE (Temporary Memory)
+                    # ADD TO SESSION STATE
                     st.session_state.new_bands = pd.concat([st.session_state.new_bands, new_entry], ignore_index=True)
-                    st.success(f"Found {name}! Added to the map.")
-                    st.rerun() # Refresh the page to show the new dot
+                    st.success(f"Found {name}! (Energy: {energy_score:.2f}, Valence: {valence_score:.2f})")
+                    st.rerun()
                 else:
                     st.error("Band not found on Last.fm.")
 
