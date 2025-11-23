@@ -2,73 +2,144 @@ import streamlit as st
 import pandas as pd
 import requests
 import gspread
+import urllib3
+import time
 from google.oauth2.service_account import Credentials
 from streamlit_agraph import agraph, Node, Edge, Config
-import plotly.express as px 
+import random 
+import json
+# ML Imports
+from sklearn.preprocessing import StandardScaler
+from sklearn.neighbors import NearestNeighbors
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(layout="wide", page_title="tu-nerr")
 st.title("🎵 tu-nerr: The Discovery Engine")
 
+# Silence SSL Warnings
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 # --- 1. GOOGLE SHEETS CONNECTION ---
 @st.cache_resource
 def get_sheet_connection():
-    """Connects to Google Sheets using secrets."""
-    scope = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive"
-    ]
+    """Connects to Google Sheets using secrets, ensuring key is parsed correctly."""
+    scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+    
     try:
-        creds = Credentials.from_service_account_info(
-            st.secrets["gcp_service_account"], scopes=scope
-        )
+        gcp_secrets = st.secrets["gcp_service_account"]
+        
+        # Handle the private key newlines safely
+        private_key_string = gcp_secrets["private_key"]
+        if "\\n" in private_key_string:
+            fixed_private_key = private_key_string.replace('\\n', '\n')
+        else:
+            fixed_private_key = private_key_string
+            
+        # Rebuild dictionary to ensure clean parsing
+        creds_info = {
+            "type": gcp_secrets["type"],
+            "project_id": gcp_secrets["project_id"],
+            "private_key_id": gcp_secrets["private_key_id"],
+            "private_key": fixed_private_key,
+            "client_email": gcp_secrets["client_email"],
+            "client_id": gcp_secrets["client_id"],
+            "auth_uri": gcp_secrets["auth_uri"],
+            "token_uri": gcp_secrets["token_uri"],
+            "auth_provider_x509_cert_url": gcp_secrets["auth_provider_x509_cert_url"],
+            "client_x509_cert_url": gcp_secrets["client_x509_cert_url"],
+        }
+        
+        creds = Credentials.from_service_account_info(creds_info, scopes=scope)
         client = gspread.authorize(creds)
         return client.open("tu-nerr-db").sheet1
     except Exception as e:
-        st.error(f"🚨 Connection Error: {e}")
+        st.error(f"🚨 FATAL CONNECTION FAILURE: {e}")
         st.stop()
 
 # --- 2. DATA FUNCTIONS ---
 def load_data():
-    """Fetches all data from the Google Sheet."""
+    """Fetches and cleans data."""
     sheet = get_sheet_connection()
     data = sheet.get_all_records()
     df = pd.DataFrame(data)
+    
+    # Handle empty DB
+    if df.empty or 'Artist' not in df.columns:
+        return pd.DataFrame(columns=['Artist', 'Genre', 'Monthly Listeners', 'Energy', 'Valence', 'Image URL', 'Artist_Lower'])
+    
+    # Fix Numbers
     cols_to_fix = ['Monthly Listeners', 'Energy', 'Valence']
     for col in cols_to_fix:
         df[col] = pd.to_numeric(df[col], errors='coerce')
-    if not df.empty:
-        df['Artist_Lower'] = df['Artist'].str.strip().str.lower()
-        # Create a Log scale for Z-Axis
-        import numpy as np
-        df['Log_Listeners'] = np.log10(df['Monthly Listeners'].replace(0, 1))
-    else:
-        df['Artist_Lower'] = []
+    
+    # Clean Text
+    df['Artist'] = df['Artist'].astype(str).str.strip()
+    df = df[df['Artist'].str.len() > 0]
+    df['Artist_Lower'] = df['Artist'].str.lower()
+    df = df.drop_duplicates(subset=['Artist_Lower'], keep='first')
+    
     return df
 
 def save_artist(artist_data):
-    """Appends a new artist row to the Google Sheet."""
+    """Appends a new artist."""
     sheet = get_sheet_connection()
     row = [
-        artist_data['Artist'],
-        artist_data['Genre'],
-        artist_data['Monthly Listeners'],
-        artist_data['Energy'],
-        artist_data['Valence'],
-        artist_data['Image URL']
+        artist_data['Artist'], artist_data['Genre'], artist_data['Monthly Listeners'],
+        artist_data['Energy'], artist_data['Valence'], artist_data['Image URL']
     ]
     sheet.append_row(row)
 
-# --- 3. API FUNCTIONS ---
+def delete_artist(artist_name):
+    """Finds an artist in the sheet and deletes the row."""
+    sheet = get_sheet_connection()
+    try:
+        cell = sheet.find(artist_name, in_column=1)
+        if cell:
+            sheet.delete_rows(cell.row)
+            return True
+        return False
+    except Exception as e:
+        st.error(f"Delete Error: {e}")
+        return False
+
+# --- 3. AI ENGINE (KNN) ---
+@st.cache_data(ttl=600)
+def get_ai_neighbors(center_artist, df_db):
+    """Finds mathematically similar artists using Energy and Valence."""
+    # Require at least 5 bands to run AI
+    if len(df_db) < 5: return pd.DataFrame()
+    
+    # 1. Prepare Features (Energy, Valence)
+    # Fill NaN with 0.5 to prevent crash
+    features = df_db[['Energy', 'Valence']].fillna(0.5).values
+    
+    # 2. Scale Data (Standardize distribution)
+    scaler = StandardScaler()
+    features_scaled = scaler.fit_transform(features)
+    
+    # 3. Fit Model (Euclidean distance for 2D/3D space)
+    knn = NearestNeighbors(n_neighbors=min(6, len(df_db)), metric='euclidean')
+    knn.fit(features_scaled)
+    
+    # 4. Find Center Index
+    center_idx = df_db[df_db['Artist'] == center_artist].index
+    if center_idx.empty: return pd.DataFrame()
+    
+    # 5. Get Neighbors
+    distances, indices = knn.kneighbors([features_scaled[center_idx[0]]])
+    
+    # 6. Return DataFrame (excluding the artist itself)
+    neighbor_indices = indices[0][1:] 
+    return df_db.iloc[neighbor_indices]
+
+# --- 4. API FUNCTIONS ---
 def get_similar_artists(artist_name, api_key, limit=10):
     url = f"http://ws.audioscrobbler.com/2.0/?method=artist.getsimilar&artist={artist_name}&api_key={api_key}&limit={limit}&format=json"
     try:
         response = requests.get(url, timeout=5)
         data = response.json()
-        if 'similarartists' in data:
-            return [a['name'] for a in data['similarartists']['artist']]
-    except:
-        pass
+        if 'similarartists' in data: return [a['name'] for a in data['similarartists']['artist']]
+    except: pass
     return []
 
 def get_top_artists_by_genre(genre, api_key, limit=12):
@@ -76,10 +147,8 @@ def get_top_artists_by_genre(genre, api_key, limit=12):
     try:
         response = requests.get(url, timeout=5)
         data = response.json()
-        if 'topartists' in data:
-            return [a['name'] for a in data['topartists']['artist']]
-    except:
-        pass
+        if 'topartists' in data: return [a['name'] for a in data['topartists']['artist']]
+    except: pass
     return []
 
 def get_artist_details(artist_name, api_key):
@@ -87,10 +156,8 @@ def get_artist_details(artist_name, api_key):
     try:
         response = requests.get(url, timeout=5)
         data = response.json()
-        if 'error' not in data:
-            return data['artist']
-    except:
-        pass
+        if 'error' not in data: return data['artist']
+    except: pass
     return None
 
 def get_top_tracks(artist_name, api_key):
@@ -98,10 +165,8 @@ def get_top_tracks(artist_name, api_key):
     try:
         response = requests.get(url, timeout=5)
         data = response.json()
-        if 'error' not in data:
-            return data['toptracks']['track']
-    except:
-        pass
+        if 'error' not in data: return data['toptracks']['track']
+    except: pass
     return []
 
 def get_deezer_data(artist_name):
@@ -112,20 +177,27 @@ def get_deezer_data(artist_name):
         if data.get('data'):
             artist = data['data'][0]
             return {
-                "name": artist['name'],
-                "listeners": artist['nb_fan'],
-                "image": artist['picture_medium'],
-                "link": artist['link']
+                "name": artist['name'], "id": artist['id'], "listeners": artist['nb_fan'],
+                "image": artist['picture_medium'], "link": artist['link']
             }
-    except:
-        pass
+    except: pass
+    return None
+
+def get_deezer_preview(artist_id):
+    try:
+        url = f"https://api.deezer.com/artist/{artist_id}/top"
+        response = requests.get(url, verify=False, timeout=5)
+        data = response.json()
+        if data.get('data') and len(data['data']) > 0:
+            track = data['data'][0]
+            return { "title": track['title'], "preview": track['preview'] }
+    except: pass
     return None
 
 def process_artist(name, df_db, api_key):
     if not df_db.empty:
         match = df_db[df_db['Artist_Lower'] == name.strip().lower()]
-        if not match.empty:
-            return match.iloc[0].to_dict()
+        if not match.empty: return match.iloc[0].to_dict()
 
     deezer_info = get_deezer_data(name)
     clean_name = deezer_info['name'] if deezer_info else name
@@ -141,29 +213,35 @@ def process_artist(name, df_db, api_key):
 
         tags = [tag['name'].lower() for tag in lastfm_info['tags']['tag']]
         
-        ENERGY_SCORES = {'death metal': 1.0, 'thrash': 0.95, 'metalcore': 0.9, 'punk': 0.9, 'industrial': 0.85, 'hard rock': 0.8, 'hip hop': 0.75, 'rock': 0.7, 'electronic': 0.65, 'pop': 0.6, 'indie': 0.5, 'alternative': 0.5, 'folk': 0.3, 'soul': 0.3, 'country': 0.4, 'jazz': 0.35, 'ambient': 0.1, 'acoustic': 0.2, 'classical': 0.15}
-        VALENCE_SCORES = {'happy': 0.9, 'party': 0.9, 'dance': 0.85, 'pop': 0.8, 'upbeat': 0.8, 'funk': 0.75, 'soul': 0.7, 'country': 0.6, 'folk': 0.5, 'progressive': 0.45, 'alternative': 0.4, 'rock': 0.5, 'sad': 0.2, 'dark': 0.15, 'melancholic': 0.1, 'depressive': 0.05, 'doom': 0.1, 'gothic': 0.2, 'industrial': 0.3, 'angry': 0.2}
+        # VALENCE FIX: Expanded scoring dictionaries for nuanced mood/energy
+        ENERGY_SCORES = {'death': 1.0, 'thrash': 0.95, 'core': 0.95, 'metal': 0.9, 'punk': 0.9, 'heavy': 0.9,
+                         'industrial': 0.85, 'hard rock': 0.8, 'hip hop': 0.75, 'rock': 0.7, 'electronic': 0.65, 'pop': 0.6, 'indie': 0.5, 'alternative': 0.5,
+                         'folk': 0.3, 'soul': 0.3, 'country': 0.4, 'jazz': 0.35, 'ambient': 0.1, 'acoustic': 0.2, 'classical': 0.15}
+        VALENCE_SCORES = {'happy': 0.9, 'party': 0.9, 'dance': 0.85, 'pop': 0.8, 'upbeat': 0.8,
+            'funk': 0.75, 'soul': 0.7, 'country': 0.6, 'folk': 0.5,
+            'progressive': 0.5,
+            'alternative': 0.4, 
+            'rock': 0.45,
+            'sad': 0.2, 'dark': 0.15, 'melancholic': 0.1, 'depressive': 0.05,
+            'doom': 0.1, 'gothic': 0.2, 
+            'industrial': 0.3, 'angry': 0.3, 
+            'metal': 0.3, 
+            'heavy': 0.3, 
+            'thrash': 0.2,
+            'death': 0.1
+        }
 
         def calculate_score(tag_list, score_dict):
-            found_scores = []
-            for tag in tag_list:
-                for genre, score in score_dict.items():
-                    if genre in tag:
-                        found_scores.append(score)
-            if not found_scores: return 0.5
-            return sum(found_scores) / len(found_scores)
+            scores = [score for tag, score in score_dict.items() for t in tag_list if tag in t]
+            return sum(scores)/len(scores) if scores else 0.5
 
         energy = calculate_score(tags, ENERGY_SCORES)
         valence = calculate_score(tags, VALENCE_SCORES)
         main_genre = tags[0].title() if tags else "Unknown"
 
         new_data = {
-            "Artist": clean_name,
-            "Genre": main_genre,
-            "Monthly Listeners": final_listeners,
-            "Energy": energy,
-            "Valence": valence,
-            "Image URL": final_image
+            "Artist": clean_name, "Genre": main_genre, "Monthly Listeners": final_listeners,
+            "Energy": energy, "Valence": valence, "Image URL": final_image
         }
         
         save_artist(new_data)
@@ -171,190 +249,176 @@ def process_artist(name, df_db, api_key):
     
     return None
 
-# --- 4. REUSABLE DISCOVERY ENGINE (RESTORED!) ---
-def run_discovery_sequence(center_entity, mode, api_key, df_db):
-    """Central logic for finding and mapping clusters."""
-    target_list = []
-    
-    with st.spinner(f"Scanning the cosmos for {center_entity}..."):
+# --- 5. DISCOVERY LOGIC ---
+def run_discovery(center, mode, api_key, df_db):
+    targets = []
+    with st.spinner(f"Scanning: {center}..."):
         if mode == "Artist":
-            target_list.append(center_entity)
-            similar = get_similar_artists(center_entity, api_key, limit=10)
-            target_list.extend(similar)
+            targets.append(center)
+            targets.extend(get_similar_artists(center, api_key))
         else:
-            target_list = get_top_artists_by_genre(center_entity, api_key, limit=12)
+            targets = get_top_artists_by_genre(center, api_key)
     
-    target_list = list(set(target_list))
-
-    current_session_data = []
-    progress_bar = st.progress(0)
-    
-    for i, artist in enumerate(target_list):
-        progress_bar.progress((i + 1) / len(target_list))
+    session_data = []
+    prog = st.progress(0)
+    for i, artist in enumerate(set(targets)):
+        prog.progress((i + 1) / len(set(targets)))
         data = process_artist(artist, df_db, api_key)
-        if data:
-            current_session_data.append(data)
-        # Refresh DB copy occasionally
-        if i % 3 == 0: df_db = load_data() 
-
-    if current_session_data:
-        session_df = pd.DataFrame(current_session_data).drop_duplicates(subset=['Artist'])
-        st.session_state.view_df = session_df
-        st.session_state.center_node = center_entity if mode == "Artist" else None
+        if data: session_data.append(data)
+        if i % 3 == 0: df_db = load_data()
+    
+    if session_data:
+        st.session_state.view_df = pd.DataFrame(session_data).drop_duplicates(subset=['Artist'])
+        st.session_state.center_node = center if mode == "Artist" else None
         return True
     return False
 
-# --- 5. LOAD DATA INITIAL ---
+# --- 6. INITIAL LOAD ---
 try:
     df_db = load_data()
 except Exception as e:
-    st.error("Could not load data. Check secrets.")
+    st.error(f"Startup Error: {e}")
     st.stop()
 
-# --- 6. SIDEBAR: THE EXPLORER ---
+# --- 7. SIDEBAR ---
 with st.sidebar:
     st.header("🚀 Discovery Engine")
-    
-    with st.form(key='search_form'):
-        search_mode = st.radio("Search By:", ["Artist", "Genre"])
-        search_query = st.text_input(f"Enter {search_mode} Name:")
-        submit_button = st.form_submit_button(label='Launch Discovery')
-    
-    if submit_button:
-        if search_query:
-            try:
-                api_key = st.secrets["lastfm_key"]
-            except FileNotFoundError:
-                st.error("API Key missing!")
-                st.stop()
-
-            success = run_discovery_sequence(search_query, search_mode, api_key, df_db)
-            if success:
-                st.success(f"Discovery complete!")
-                st.rerun()
-            else:
-                st.error("No data found.")
+    with st.form(key='search'):
+        mode = st.radio("Search By:", ["Artist", "Genre"])
+        query = st.text_input(f"Enter {mode} Name:")
+        if st.form_submit_button("Launch"):
+            if query:
+                try:
+                    key = st.secrets["lastfm_key"]
+                    if run_discovery(query, mode, key, df_db): st.rerun()
+                    else: st.error("No data found.")
+                except Exception as e: st.error(f"Search error: {e}")
     
     st.divider()
-    if st.button("🔄 Reset / Show Global Galaxy"):
+    if st.button("🔄 Reset Map"):
         if 'view_df' in st.session_state: del st.session_state['view_df']
         if 'center_node' in st.session_state: del st.session_state['center_node']
         st.cache_data.clear()
         st.rerun()
 
-# --- 7. VISUALIZATION (HYBRID VIEW) ---
+    with st.expander("🔐 Admin"):
+        pw = st.text_input("Password:", type="password")
+        if pw and pw == st.secrets.get("admin_password", ""):
+            if not df_db.empty:
+                artist_del = st.selectbox("Delete Artist", df_db['Artist'].sort_values().unique())
+                if st.button("Delete"):
+                    delete_artist(artist_del)
+                    st.cache_data.clear()
+                    st.rerun()
 
-selected_artist = None
-
-# LOGIC: If we are in "Search Mode", show the Solar System Graph.
-if 'view_df' in st.session_state and not st.session_state.view_df.empty:
-    st.subheader(f"🔭 System: {st.session_state.center_node or search_query}")
-    display_df = st.session_state.view_df
-    
-    nodes = []
-    edges = []
-    added_node_ids = set() 
-
-    for index, row in display_df.iterrows():
-        if row['Artist'] in added_node_ids: continue
-        size = 25
-        if row['Monthly Listeners'] > 1000000: size = 40
-        if row['Monthly Listeners'] > 10000000: size = 60
-        
-        if 'center_node' in st.session_state and st.session_state.center_node:
-            if row['Artist'].lower() == st.session_state.center_node.lower():
-                size = 100
-        
-        tooltip_text = f"Genre: {row['Genre']}\nFans: {int(row['Monthly Listeners']):,}\nEnergy: {row['Energy']:.2f}\nMood: {row['Valence']:.2f}"
-        nodes.append(Node(id=row['Artist'], label=row['Artist'], size=size, shape="circularImage", image=row['Image URL'], title=tooltip_text))
-        added_node_ids.add(row['Artist'])
-
-    center = st.session_state.center_node
-    if center:
-        real_center_name = next((row['Artist'] for i, row in display_df.iterrows() if row['Artist'].lower() == center.lower()), None)
-        if real_center_name:
-            for index, row in display_df.iterrows():
-                if row['Artist'] != real_center_name:
-                    edges.append(Edge(source=real_center_name, target=row['Artist'], color="#888888"))
-
-    config = Config(width="100%", height=600, directed=False, physics=True, hierarchical=False, nodeHighlightBehavior=True, highlightColor="#F7A7A6", collapsible=True)
-    selected_artist = agraph(nodes=nodes, edges=edges, config=config)
-
-else:
-    # --- VIEW B: GLOBAL GALAXY (3D SCATTER) ---
-    st.subheader("🌍 The Universal Galaxy")
-    
+# --- 8. VISUALIZATION ---
+if 'view_df' not in st.session_state or st.session_state.view_df.empty:
+    # Show random sample if no search active
     if not df_db.empty:
-        fig = px.scatter_3d(
-            df_db,
-            x='Valence',
-            y='Energy',
-            z='Log_Listeners', 
-            color='Genre',
-            hover_name='Artist',
-            hover_data=['Monthly Listeners', 'Genre'],
-            size='Monthly Listeners',
-            size_max=50,
-            opacity=0.8,
-            template="plotly_dark",
-            height=700
-        )
-        fig.update_layout(scene=dict(xaxis_title='Sad ⟵ Mood ⟶ Happy', yaxis_title='Mellow ⟵ Intensity ⟶ Heavy', zaxis_title='Underground ⟵ Fame ⟶ Mainstream'), margin=dict(l=0, r=0, b=0, t=0))
-        
-        event = st.plotly_chart(fig, use_container_width=True, on_select="rerun", selection_mode="points")
-        
-        if len(event.selection["points"]) > 0:
-            point_index = event.selection["points"][0]["point_index"]
-            selected_artist = df_db.iloc[point_index]["Artist"]
+        st.session_state.view_df = df_db.sample(min(len(df_db), 20))
+        st.session_state.center_node = st.session_state.view_df.sort_values('Monthly Listeners', ascending=False).iloc[0]['Artist']
     else:
-        st.info("Database empty.")
+        st.session_state.view_df = pd.DataFrame()
 
-# --- 8. THE DASHBOARD ---
-if selected_artist and not selected_artist.startswith("genre_"):
+disp_df = st.session_state.view_df
+center = st.session_state.get('center_node', 'Unknown')
+st.subheader(f"🔭 System: {center}")
+
+selected = None
+if not disp_df.empty:
+    nodes, edges, added = [], [], set()
+    
+    # Find real center name
+    real_center = next((r['Artist'] for i, r in disp_df.iterrows() if str(r['Artist']).lower() == str(center).lower()), None)
+
+    for i, r in disp_df.iterrows():
+        if r['Artist'] in added: continue
+        size = 25
+        if r['Monthly Listeners'] > 1000000: size = 40
+        if r['Monthly Listeners'] > 10000000: size = 60
+        if real_center and r['Artist'] == real_center: size = 100
+        
+        e_val = float(r['Energy'])
+        border = "#E74C3C" if e_val > 0.75 else "#2ECC71" if e_val < 0.4 else "#F1C40F"
+
+        nodes.append(Node(id=r['Artist'], label=r['Artist'], size=size, shape="circularImage", image=r['Image URL'], 
+                          title=f"{r['Genre']}\nE:{r['Energy']:.2f} V:{r['Valence']:.2f}", borderWidth=4, color={'border': border}))
+        added.add(r['Artist'])
+
+    # Global vs Search Topology
+    if not real_center and not disp_df.empty:
+        genres = disp_df['Genre'].unique()
+        for g in genres:
+            if f"g_{g}" not in added:
+                nodes.append(Node(id=f"g_{g}", label=g, size=15, color="#f1c40f", shape="star"))
+                added.add(f"g_{g}")
+        for i, r in disp_df.iterrows():
+            edges.append(Edge(source=r['Artist'], target=f"g_{r['Genre']}", color="#333333"))
+    elif real_center:
+        for i, r in disp_df.iterrows():
+            if r['Artist'] != real_center:
+                edges.append(Edge(source=real_center, target=r['Artist'], color="#888888"))
+
+    config = Config(width="100%", height=600, directed=False, physics=True, hierarchical=False, collapsible=True)
+    selected = agraph(nodes=nodes, edges=edges, config=config)
+
+# --- 9. DASHBOARD ---
+if selected and not selected.startswith("g_"):
     st.divider()
-    col_title, col_btn = st.columns([3, 1])
-    with col_title:
-        st.header(f"🤿 Deep Dive: {selected_artist}")
-    with col_btn:
-        if st.button(f"🔭 Center Map on {selected_artist}"):
-            try:
-                api_key = st.secrets["lastfm_key"]
-                run_discovery_sequence(selected_artist, "Artist", api_key, df_db)
-            except Exception as e:
-                st.error(f"Error: {e}")
+    c1, c2 = st.columns([3, 1])
+    with c1: st.header(f"🤿 {selected}")
+    with c2:
+        # TRAVEL BUTTON
+        if st.button(f"🔭 Travel Here", type="primary"):
+            run_discovery(selected, "Artist", st.secrets["lastfm_key"], df_db)
+            st.rerun()
+            
+        # AI BUTTON (New!)
+        if st.button("🤖 AI Neighbors"):
+            ai_recs = get_ai_neighbors(selected, df_db)
+            if not ai_recs.empty:
+                st.session_state.view_df = ai_recs
+                st.session_state.center_node = selected
+                st.success("AI Trajectory Calculated.")
+                time.sleep(1)
+                st.rerun()
+            else: st.error("Not enough data for AI analysis.")
 
     try:
-        api_key = st.secrets["lastfm_key"]
-        col1, col2 = st.columns([1, 2])
-        row = df_db[df_db['Artist'] == selected_artist]
-        image_url = None
-        if not row.empty: image_url = row.iloc[0]['Image URL']
+        row = df_db[df_db['Artist'] == selected]
+        img = row.iloc[0]['Image URL'] if not row.empty else None
         
-        if not image_url or "placeholder" in str(image_url):
-                live_deezer = get_deezer_data(selected_artist)
-                if live_deezer: image_url = live_deezer['image']
+        # Live fetch check
+        d_live = get_deezer_data(selected)
+        if not img or "placeholder" in str(img): # FIXED: changed str(image_url) to str(img)
+            if d_live: img = d_live['image']
+            
+        preview = None
+        if d_live and d_live.get('id'): preview = get_deezer_preview(d_live['id'])
 
+        col1, col2 = st.columns([1, 2])
         with col1:
-            if image_url and str(image_url).startswith("http"):
-                st.image(image_url)
+            if img and str(img).startswith("http"): st.image(img)
+            if preview: 
+                st.audio(preview['preview'])
+                st.caption(f"🎵 {preview['title']}")
+            
             if not row.empty:
-                st.metric("Monthly Listeners", f"{int(row.iloc[0]['Monthly Listeners']):,}")
-                st.write(f"**Genre:** {row.iloc[0]['Genre']}")
-                st.caption(f"Energy: {float(row.iloc[0]['Energy']):.2f}")
-                st.progress(float(row.iloc[0]['Energy']))
-                st.caption(f"Mood: {float(row.iloc[0]['Valence']):.2f}")
-                st.progress(float(row.iloc[0]['Valence']))
+                st.metric("Fans", f"{int(row.iloc[0]['Monthly Listeners']):,}")
+                e, v = float(row.iloc[0]['Energy']), float(row.iloc[0]['Valence'])
+                st.caption(f"🔥 Energy: {e:.2f}")
+                st.progress(e)
+                st.caption(f"😊 Mood: {v:.2f}")
+                st.progress(v)
 
         with col2:
-            with st.spinner("Fetching tracks..."):
-                details = get_artist_details(selected_artist, api_key)
-                tracks = get_top_tracks(selected_artist, api_key)
-
-            if details and 'bio' in details:
-                    st.info(details['bio']['summary'].split("<a href")[0])
+            with st.spinner("Fetching info..."):
+                det = get_artist_details(selected, st.secrets["lastfm_key"])
+                trx = get_top_tracks(selected, st.secrets["lastfm_key"])
             
-            track_data = [{"Song": t['name'], "Playcount": f"{int(t['playcount']):,}", "Link": t['url']} for t in tracks]
-            st.dataframe(pd.DataFrame(track_data), column_config={"Link": st.column_config.LinkColumn("Listen")}, hide_index=True, use_container_width=True)
-
-    except Exception as e:
-        st.error(f"Could not load details. {e}")
+            if det and 'bio' in det: st.info(det['bio']['summary'].split("<a href")[0])
+            if trx:
+                t_data = [{"Song": t['name'], "Plays": f"{int(t['playcount']):,}", "Link": t['url']} for t in trx]
+                st.dataframe(pd.DataFrame(t_data), column_config={"Link": st.column_config.LinkColumn("Link")}, hide_index=True)
+                
+    except Exception as e: st.error(f"Error: {e}")
