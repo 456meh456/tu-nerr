@@ -5,4 +5,5 @@ requests
 gspread
 google-auth
 streamlit-agraph
-plotly
+toml
+urlib3
