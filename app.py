@@ -165,7 +165,7 @@ def get_ai_neighbors(center_artist, df_db):
     # HYBRID METRIC: Use Audio Brightness if available, else Tag Energy
     df_calc = df_db.copy()
     df_calc['Calc_Energy'] = df_calc.apply(
-        lambda x: x['Audio_Brightness'] if x['Audio_Brightness'] > 0 else x['Tag_Energy'], axis=1
+        lambda x: x['Audio_Brightness'] if x.get('Audio_Brightness', 0) > 0 else x['Tag_Energy'], axis=1
     )
     
     # Prepare features: Brightness (Timbre), Mood (Valence), Tempo (BPM)
@@ -404,8 +404,13 @@ if not disp_df.empty:
         
         border = "#E74C3C" if energy > 0.7 else "#2ECC71" if energy < 0.3 else "#F1C40F"
 
-        nodes.append(Node(id=r['Artist'], label=r['Artist'], size=size, shape="circularImage", image=r['Image URL'], 
-                          title=f"BPM: {bpm}\nBrightness: {energy:.2f}\nMood: {r['Valence']}", borderWidth=4, color={'border': border}))
+        nodes.append(Node(
+            id=r['Artist'],
+            label=r['Artist'],
+            size=size,
+            shape="circularImage",
+            image=r['Image URL'],
+            title=f"BPM: {bpm}\nBrightness: {energy:.2f}\nMood: {r['Valence']}", borderWidth=4, color={'border': border}))
         added.add(r['Artist'])
 
     if real_center:
@@ -460,7 +465,6 @@ if selected:
         with col2:
             det = get_artist_details(selected, st.secrets["lastfm_key"])
             tracks = get_top_tracks(selected, st.secrets["lastfm_key"])
-            
             if det and 'bio' in det: st.info(det['bio']['summary'].split("<a href")[0])
             if tracks:
                 t_data = [{"Song": t['name'], "Plays": f"{int(t['playcount']):,}", "Link": t['url']} for t in tracks]
