@@ -228,18 +228,9 @@ def get_deezer_data(artist_name):
         data = response.json()
         if data.get('data'):
             artist = data['data'][0]
-            # We need to fetch the track list to get a preview URL for analysis
-            track_url = f"https://api.deezer.com/artist/{artist['id']}/top"
-            t_resp = requests.get(track_url, verify=False, timeout=5).json()
-            preview = t_resp['data'][0]['preview'] if t_resp.get('data') else None
-
             return {
-                "name": artist['name'],
-                "id": artist['id'],
-                "listeners": artist['nb_fan'],
-                "image": artist['picture_medium'],
-                "link": artist['link'],
-                "preview": preview
+                "name": artist['name'], "id": artist['id'], "listeners": artist['nb_fan'],
+                "image": artist['picture_medium'], "link": artist['link']
             }
     except: pass
     return None
@@ -346,12 +337,15 @@ def run_discovery(center, mode, api_key, df_db):
 # --- 7. INITIAL LOAD ---
 try:
     df_db = load_data()
-except:
+except Exception as e:
+    st.error(f"🚨 Startup Error: {e}")
     st.stop()
 
 # --- 8. SIDEBAR ---
 with st.sidebar:
     st.header("🚀 Discovery Engine")
+    if st.button("🔄 Refresh Data"): st.cache_data.clear(); st.rerun()
+    
     with st.form(key='search'):
         mode = st.radio("Search By:", ["Artist", "Genre"])
         query = st.text_input(f"Enter {mode} Name:")
@@ -439,7 +433,7 @@ if selected:
                 st.success("AI Trajectory Calculated.")
                 time.sleep(1)
                 st.rerun()
-            else: st.error("Not enough data for AI.")
+            else: st.error("Not enough data.")
 
     row = df_db[df_db['Artist'] == selected]
     if not row.empty:
@@ -465,11 +459,11 @@ if selected:
 
         with col2:
             det = get_artist_details(selected, st.secrets["lastfm_key"])
-            trx = get_top_tracks(selected, st.secrets["lastfm_key"])
+            tracks = get_top_tracks(selected, st.secrets["lastfm_key"])
             
             if det and 'bio' in det: st.info(det['bio']['summary'].split("<a href")[0])
-            if trx:
-                t_data = [{"Song": t['name'], "Plays": f"{int(t['playcount']):,}", "Link": t['url']} for t in trx]
+            if tracks:
+                t_data = [{"Song": t['name'], "Plays": f"{int(t['playcount']):,}", "Link": t['url']} for t in tracks]
                 st.dataframe(pd.DataFrame(t_data), column_config={"Link": st.column_config.LinkColumn("Link")}, hide_index=True)
 
 else:
