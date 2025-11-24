@@ -12,6 +12,7 @@ import librosa
 from google.oauth2.service_account import Credentials
 from streamlit_agraph import agraph, Node, Edge, Config
 import json
+# ML Imports
 from sklearn.preprocessing import StandardScaler
 from sklearn.neighbors import NearestNeighbors
 
@@ -337,8 +338,7 @@ def run_discovery(center, mode, api_key, df_db):
 # --- 7. INITIAL LOAD ---
 try:
     df_db = load_data()
-except Exception as e:
-    st.error(f"🚨 Startup Error: {e}")
+except:
     st.stop()
 
 # --- 8. SIDEBAR ---
@@ -465,6 +465,7 @@ if selected:
         with col2:
             det = get_artist_details(selected, st.secrets["lastfm_key"])
             tracks = get_top_tracks(selected, st.secrets["lastfm_key"])
+            
             if det and 'bio' in det: st.info(det['bio']['summary'].split("<a href")[0])
             if tracks:
                 t_data = [{"Song": t['name'], "Plays": f"{int(t['playcount']):,}", "Link": t['url']} for t in tracks]
