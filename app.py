@@ -6,6 +6,7 @@ import urllib3
 import time
 from google.oauth2.service_account import Credentials
 from streamlit_agraph import agraph, Node, Edge, Config
+import random 
 import json
 # ML Imports
 from sklearn.preprocessing import StandardScaler
@@ -203,17 +204,27 @@ def process_artist(name, df_db, api_key):
     lastfm_info = get_artist_details(clean_name, api_key)
 
     if lastfm_info:
-        if deezer_info:
-            final_listeners = deezer_info['listeners']
-            final_image = deezer_info['image']
-        else:
-            final_listeners = int(lastfm_info['stats']['listeners'])
-            final_image = "https://commons.wikimedia.org/wiki/Special:FilePath/A_placeholder_box.svg"
-
+        img = deezer_info['image'] if deezer_info else "https://commons.wikimedia.org/wiki/Special:FilePath/A_placeholder_box.svg"
+        listeners = deezer_info['listeners'] if deezer_info else int(lastfm_info['stats']['listeners'])
         tags = [tag['name'].lower() for tag in lastfm_info['tags']['tag']]
         
-        ENERGY_SCORES = {'death': 1.0, 'thrash': 0.95, 'core': 0.95, 'metal': 0.9, 'punk': 0.9, 'heavy': 0.9, 'industrial': 0.85, 'hard rock': 0.8, 'hip hop': 0.75, 'rock': 0.7, 'electronic': 0.65, 'pop': 0.6, 'indie': 0.5, 'folk': 0.3, 'soul': 0.3, 'country': 0.4, 'jazz': 0.35, 'ambient': 0.1, 'acoustic': 0.2, 'classical': 0.15}
-        VALENCE_SCORES = {'happy': 0.9, 'party': 0.9, 'dance': 0.85, 'pop': 0.8, 'upbeat': 0.8, 'funk': 0.75, 'soul': 0.7, 'country': 0.6, 'folk': 0.5, 'progressive': 0.5, 'rock': 0.45, 'sad': 0.2, 'dark': 0.15, 'doom': 0.1, 'gothic': 0.2, 'industrial': 0.3, 'angry': 0.3, 'metal': 0.3, 'heavy': 0.3, 'thrash': 0.2, 'death': 0.1}
+        # VALENCE FIX: Expanded scoring dictionaries for nuanced mood/energy
+        ENERGY_SCORES = {'death': 1.0, 'thrash': 0.95, 'core': 0.95, 'metal': 0.9, 'punk': 0.9, 'heavy': 0.9,
+                         'industrial': 0.85, 'hard rock': 0.8, 'hip hop': 0.75, 'rock': 0.7, 'electronic': 0.65, 'pop': 0.6, 'indie': 0.5, 'alternative': 0.5,
+                         'folk': 0.3, 'soul': 0.3, 'country': 0.4, 'jazz': 0.35, 'ambient': 0.1, 'acoustic': 0.2, 'classical': 0.15}
+        VALENCE_SCORES = {'happy': 0.9, 'party': 0.9, 'dance': 0.85, 'pop': 0.8, 'upbeat': 0.8,
+            'funk': 0.75, 'soul': 0.7, 'country': 0.6, 'folk': 0.5,
+            'progressive': 0.5,
+            'alternative': 0.4, 
+            'rock': 0.45,
+            'sad': 0.2, 'dark': 0.15, 'melancholic': 0.1, 'depressive': 0.05,
+            'doom': 0.1, 'gothic': 0.2, 
+            'industrial': 0.3, 'angry': 0.3, 
+            'metal': 0.3, 
+            'heavy': 0.3, 
+            'thrash': 0.2,
+            'death': 0.1
+        }
 
         def calculate_score(tag_list, score_dict):
             scores = [score for tag, score in score_dict.items() for t in tag_list if tag in t]
@@ -223,12 +234,15 @@ def process_artist(name, df_db, api_key):
         valence = calculate_score(tags, VALENCE_SCORES)
         main_genre = tags[0].title() if tags else "Unknown"
 
+        # FIX: Use the correct variable names (img and listeners) here
         new_data = {
-            "Artist": clean_name, "Genre": main_genre, "Monthly Listeners": final_listeners,
-            "Energy": energy, "Valence": valence, "Image URL": final_image
+            "Artist": clean_name, "Genre": main_genre, "Monthly Listeners": listeners,
+            "Energy": energy, "Valence": valence, "Image URL": img
         }
+        
         save_artist(new_data)
         return new_data
+    
     return None
 
 # --- 5. DISCOVERY LOGIC ---
@@ -269,9 +283,11 @@ with st.sidebar:
         query = st.text_input(f"Enter {mode} Name:")
         if st.form_submit_button("Launch"):
             if query:
-                if run_discovery(query, mode, st.secrets["lastfm_key"], df_db):
-                    st.rerun()
-                else: st.error("No data found.")
+                try:
+                    key = st.secrets["lastfm_key"]
+                    if run_discovery(query, mode, key, df_db): st.rerun()
+                    else: st.error("No data found.")
+                except Exception as e: st.error(f"Search error: {e}")
     
     st.divider()
     if st.button("🔄 Reset Map"):
@@ -346,7 +362,6 @@ if selected and not selected.startswith("g_"):
             run_discovery(selected, "Artist", st.secrets["lastfm_key"], df_db)
             st.rerun()
         
-        # AI BUTTON
         if st.button("🤖 AI Neighbors"):
             ai_recs = get_ai_neighbors(selected, df_db)
             if not ai_recs.empty:
@@ -394,3 +409,7 @@ if selected and not selected.startswith("g_"):
                 st.dataframe(pd.DataFrame(t_data), column_config={"Link": st.column_config.LinkColumn("Link")}, hide_index=True)
                 
     except Exception as e: st.error(f"Error: {e}")
+
+else:
+    if df_db.empty:
+        st.info("The database is empty! Use the sidebar to start your first search.")
