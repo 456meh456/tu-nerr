@@ -1,6 +1,5 @@
 streamlit
 pandas
-numpy<2
 requests
 gspread
 google-auth
@@ -9,4 +8,5 @@ toml
 urllib3
 scikit-learn
 scipy
-plotly
+librosa
+numpy

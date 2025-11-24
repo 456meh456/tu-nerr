@@ -4,11 +4,14 @@ import requests
 import gspread
 import urllib3
 import time
+import io
+import os
+import tempfile
+import numpy as np
+import librosa
 from google.oauth2.service_account import Credentials
 from streamlit_agraph import agraph, Node, Edge, Config
-import random 
 import json
-# ML Imports
 from sklearn.preprocessing import StandardScaler
 from sklearn.neighbors import NearestNeighbors
 
@@ -65,12 +68,13 @@ def load_data():
     
     # Handle empty DB
     if df.empty or 'Artist' not in df.columns:
-        return pd.DataFrame(columns=['Artist', 'Genre', 'Monthly Listeners', 'Energy', 'Valence', 'Image URL', 'Artist_Lower'])
+        return pd.DataFrame(columns=['Artist', 'Genre', 'Monthly Listeners', 'Tag_Energy', 'Valence', 'Audio_BPM', 'Audio_Brightness', 'Image URL', 'Artist_Lower'])
     
     # Fix Numbers
-    cols_to_fix = ['Monthly Listeners', 'Energy', 'Valence']
+    cols_to_fix = ['Monthly Listeners', 'Tag_Energy', 'Valence', 'Audio_BPM', 'Audio_Brightness']
     for col in cols_to_fix:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
     
     # Clean Text
     df['Artist'] = df['Artist'].astype(str).str.strip()
@@ -84,8 +88,14 @@ def save_artist(artist_data):
     """Appends a new artist."""
     sheet = get_sheet_connection()
     row = [
-        artist_data['Artist'], artist_data['Genre'], artist_data['Monthly Listeners'],
-        artist_data['Energy'], artist_data['Valence'], artist_data['Image URL']
+        artist_data['Artist'], 
+        artist_data['Genre'], 
+        artist_data['Monthly Listeners'],
+        artist_data['Tag_Energy'], 
+        artist_data['Valence'], 
+        artist_data.get('Audio_BPM', 0), 
+        artist_data.get('Audio_Brightness', 0),
+        artist_data['Image URL']
     ]
     sheet.append_row(row)
 
@@ -102,37 +112,79 @@ def delete_artist(artist_name):
         st.error(f"Delete Error: {e}")
         return False
 
-# --- 3. AI ENGINE (KNN) ---
+# --- 3. AUDIO ENGINE (LIVE) ---
+def analyze_audio(preview_url):
+    """Downloads MP3 to temp file and extracts real physics."""
+    tmp_path = None
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    }
+    
+    try:
+        if not preview_url: return 0, 0
+        
+        # 1. Download MP3
+        response = requests.get(preview_url, headers=headers, verify=False, timeout=5)
+        
+        # 2. Save to Temp File
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
+            tmp.write(response.content)
+            tmp_path = tmp.name
+        
+        # 3. Load into Librosa
+        y, sr = librosa.load(tmp_path, duration=30, sr=22050, mono=True)
+        
+        # 4. Extract Features
+        onset_env = librosa.onset.onset_strength(y=y, sr=sr)
+        tempo = librosa.beat.tempo(onset_envelope=onset_env, sr=sr)
+        
+        if isinstance(tempo, np.ndarray):
+            bpm = round(float(tempo[0]))
+        else:
+            bpm = round(float(tempo))
+            
+        spectral_centroids = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
+        brightness = np.mean(spectral_centroids)
+        norm_brightness = min(brightness / 3000, 1.0)
+        
+        return bpm, round(norm_brightness, 2)
+
+    except Exception as e:
+        return 0, 0 
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try: os.remove(tmp_path)
+            except: pass
+
+# --- 4. AI ENGINE (KNN) ---
 @st.cache_data(ttl=600)
 def get_ai_neighbors(center_artist, df_db):
-    """Finds mathematically similar artists using Energy and Valence."""
-    # Require at least 5 bands to run AI
+    """Finds mathematically similar artists using Audio Physics and Mood."""
     if len(df_db) < 5: return pd.DataFrame()
     
-    # 1. Prepare Features (Energy, Valence)
-    # Fill NaN with 0.5 to prevent crash
-    features = df_db[['Energy', 'Valence']].fillna(0.5).values
+    # HYBRID METRIC: Use Audio Brightness if available, else Tag Energy
+    df_calc = df_db.copy()
+    df_calc['Calc_Energy'] = df_calc.apply(
+        lambda x: x['Audio_Brightness'] if x['Audio_Brightness'] > 0 else x['Tag_Energy'], axis=1
+    )
     
-    # 2. Scale Data (Standardize distribution)
+    # Prepare features: Brightness (Timbre), Mood (Valence), Tempo (BPM)
+    # Note: We fill NaNs with safe defaults
+    features = df_calc[['Calc_Energy', 'Valence', 'Audio_BPM']].fillna(0).values
     scaler = StandardScaler()
     features_scaled = scaler.fit_transform(features)
     
-    # 3. Fit Model (Euclidean distance for 2D/3D space)
     knn = NearestNeighbors(n_neighbors=min(6, len(df_db)), metric='euclidean')
     knn.fit(features_scaled)
     
-    # 4. Find Center Index
     center_idx = df_db[df_db['Artist'] == center_artist].index
     if center_idx.empty: return pd.DataFrame()
     
-    # 5. Get Neighbors
     distances, indices = knn.kneighbors([features_scaled[center_idx[0]]])
-    
-    # 6. Return DataFrame (excluding the artist itself)
     neighbor_indices = indices[0][1:] 
     return df_db.iloc[neighbor_indices]
 
-# --- 4. API FUNCTIONS ---
+# --- 5. API FUNCTIONS ---
 def get_similar_artists(artist_name, api_key, limit=10):
     url = f"http://ws.audioscrobbler.com/2.0/?method=artist.getsimilar&artist={artist_name}&api_key={api_key}&limit={limit}&format=json"
     try:
@@ -176,9 +228,18 @@ def get_deezer_data(artist_name):
         data = response.json()
         if data.get('data'):
             artist = data['data'][0]
+            # We need to fetch the track list to get a preview URL for analysis
+            track_url = f"https://api.deezer.com/artist/{artist['id']}/top"
+            t_resp = requests.get(track_url, verify=False, timeout=5).json()
+            preview = t_resp['data'][0]['preview'] if t_resp.get('data') else None
+
             return {
-                "name": artist['name'], "id": artist['id'], "listeners": artist['nb_fan'],
-                "image": artist['picture_medium'], "link": artist['link']
+                "name": artist['name'],
+                "id": artist['id'],
+                "listeners": artist['nb_fan'],
+                "image": artist['picture_medium'],
+                "link": artist['link'],
+                "preview": preview
             }
     except: pass
     return None
@@ -194,13 +255,23 @@ def get_deezer_preview(artist_id):
     except: pass
     return None
 
-def process_artist(name, df_db, api_key):
+def process_artist(name, df_db, api_key, session_added_set):
+    # Check Local Session Cache first (Duplicate Prevention)
+    if name.strip().lower() in session_added_set:
+        return None
+
+    # Check Database
     if not df_db.empty:
         match = df_db[df_db['Artist_Lower'] == name.strip().lower()]
         if not match.empty: return match.iloc[0].to_dict()
 
     deezer_info = get_deezer_data(name)
     clean_name = deezer_info['name'] if deezer_info else name
+    
+    # Double check Name after Deezer cleanup
+    if clean_name.strip().lower() in session_added_set:
+        return None
+
     lastfm_info = get_artist_details(clean_name, api_key)
 
     if lastfm_info:
@@ -208,44 +279,41 @@ def process_artist(name, df_db, api_key):
         listeners = deezer_info['listeners'] if deezer_info else int(lastfm_info['stats']['listeners'])
         tags = [tag['name'].lower() for tag in lastfm_info['tags']['tag']]
         
-        # VALENCE FIX: Expanded scoring dictionaries for nuanced mood/energy
-        ENERGY_SCORES = {'death': 1.0, 'thrash': 0.95, 'core': 0.95, 'metal': 0.9, 'punk': 0.9, 'heavy': 0.9,
-                         'industrial': 0.85, 'hard rock': 0.8, 'hip hop': 0.75, 'rock': 0.7, 'electronic': 0.65, 'pop': 0.6, 'indie': 0.5, 'alternative': 0.5,
-                         'folk': 0.3, 'soul': 0.3, 'country': 0.4, 'jazz': 0.35, 'ambient': 0.1, 'acoustic': 0.2, 'classical': 0.15}
-        VALENCE_SCORES = {'happy': 0.9, 'party': 0.9, 'dance': 0.85, 'pop': 0.8, 'upbeat': 0.8,
-            'funk': 0.75, 'soul': 0.7, 'country': 0.6, 'folk': 0.5,
-            'progressive': 0.5,
-            'alternative': 0.4, 
-            'rock': 0.45,
-            'sad': 0.2, 'dark': 0.15, 'melancholic': 0.1, 'depressive': 0.05,
-            'doom': 0.1, 'gothic': 0.2, 
-            'industrial': 0.3, 'angry': 0.3, 
-            'metal': 0.3, 
-            'heavy': 0.3, 
-            'thrash': 0.2,
-            'death': 0.1
-        }
+        # Tag Scoring (Fallback)
+        ENERGY_SCORES = {'death': 1.0, 'metal': 0.9, 'punk': 0.9, 'rock': 0.7, 'pop': 0.6, 'acoustic': 0.2}
+        VALENCE_SCORES = {'happy': 0.9, 'party': 0.9, 'pop': 0.8, 'sad': 0.2, 'dark': 0.15, 'doom': 0.1, 'metal': 0.3}
 
-        def calculate_score(tag_list, score_dict):
-            scores = [score for tag, score in score_dict.items() for t in tag_list if tag in t]
+        def calc_score(t_list, s_dict):
+            scores = [score for tag, score in s_dict.items() for t in t_list if tag in t]
             return sum(scores)/len(scores) if scores else 0.5
 
-        energy = calculate_score(tags, ENERGY_SCORES)
-        valence = calculate_score(tags, VALENCE_SCORES)
+        tag_energy = calc_score(tags, ENERGY_SCORES)
+        tag_valence = calc_score(tags, VALENCE_SCORES)
         main_genre = tags[0].title() if tags else "Unknown"
 
-        # FIX: Use the correct variable names (img and listeners) here
+        # LIVE AUDIO ANALYSIS
+        real_bpm = 0
+        real_brightness = 0
+        if deezer_info and deezer_info.get('preview'):
+            real_bpm, real_brightness = analyze_audio(deezer_info['preview'])
+        
+        if real_bpm == 0: 
+            real_brightness = tag_energy # Fallback if audio fails
+
         new_data = {
             "Artist": clean_name, "Genre": main_genre, "Monthly Listeners": listeners,
-            "Energy": energy, "Valence": valence, "Image URL": img
+            "Tag_Energy": tag_energy, "Valence": tag_valence, 
+            "Audio_BPM": real_bpm, "Audio_Brightness": real_brightness,
+            "Image URL": img
         }
         
         save_artist(new_data)
+        session_added_set.add(clean_name.strip().lower()) # Update session cache
         return new_data
     
     return None
 
-# --- 5. DISCOVERY LOGIC ---
+# --- 6. DISCOVERY LOGIC ---
 def run_discovery(center, mode, api_key, df_db):
     targets = []
     with st.spinner(f"Scanning: {center}..."):
@@ -257,11 +325,17 @@ def run_discovery(center, mode, api_key, df_db):
     
     session_data = []
     prog = st.progress(0)
+    
+    # Create a local set of artists added THIS session to prevent duplicates
+    if not df_db.empty:
+        session_added_set = set(df_db['Artist_Lower'].tolist())
+    else:
+        session_added_set = set()
+        
     for i, artist in enumerate(set(targets)):
         prog.progress((i + 1) / len(set(targets)))
-        data = process_artist(artist, df_db, api_key)
+        data = process_artist(artist, df_db, api_key, session_added_set)
         if data: session_data.append(data)
-        if i % 3 == 0: df_db = load_data()
     
     if session_data:
         st.session_state.view_df = pd.DataFrame(session_data).drop_duplicates(subset=['Artist'])
@@ -269,13 +343,13 @@ def run_discovery(center, mode, api_key, df_db):
         return True
     return False
 
-# --- 6. INITIAL LOAD ---
+# --- 7. INITIAL LOAD ---
 try:
     df_db = load_data()
 except:
     st.stop()
 
-# --- 7. SIDEBAR ---
+# --- 8. SIDEBAR ---
 with st.sidebar:
     st.header("🚀 Discovery Engine")
     with st.form(key='search'):
@@ -305,7 +379,7 @@ with st.sidebar:
                 st.cache_data.clear()
                 st.rerun()
 
-# --- 8. VISUALIZATION ---
+# --- 9. VISUALIZATION ---
 if 'view_df' not in st.session_state or st.session_state.view_df.empty:
     if not df_db.empty:
         st.session_state.view_df = df_db.sample(min(len(df_db), 20))
@@ -324,27 +398,23 @@ if not disp_df.empty:
 
     for i, r in disp_df.iterrows():
         if r['Artist'] in added: continue
-        size = 25
-        if r['Monthly Listeners'] > 1000000: size = 40
-        if r['Monthly Listeners'] > 10000000: size = 60
-        if real_center and r['Artist'] == real_center: size = 100
+        size = 30
+        if real_center and r['Artist'] == real_center: size = 80
         
-        e_val = float(r['Energy'])
-        border = "#E74C3C" if e_val > 0.75 else "#2ECC71" if e_val < 0.4 else "#F1C40F"
+        # VISUALIZE: Brightness (Energy) & Mood
+        audio_b = float(r.get('Audio_Brightness', 0))
+        tag_e = float(r.get('Tag_Energy', 0.5))
+        energy = audio_b if audio_b > 0 else tag_e
+        
+        bpm = int(r.get('Audio_BPM', 0))
+        
+        border = "#E74C3C" if energy > 0.7 else "#2ECC71" if energy < 0.3 else "#F1C40F"
 
         nodes.append(Node(id=r['Artist'], label=r['Artist'], size=size, shape="circularImage", image=r['Image URL'], 
-                          title=f"{r['Genre']}\nE:{r['Energy']:.2f} V:{r['Valence']:.2f}", borderWidth=4, color={'border': border}))
+                          title=f"BPM: {bpm}\nBrightness: {energy:.2f}\nMood: {r['Valence']}", borderWidth=4, color={'border': border}))
         added.add(r['Artist'])
 
-    if not real_center and not disp_df.empty: 
-        genres = disp_df['Genre'].unique()
-        for g in genres:
-            if f"g_{g}" not in added:
-                nodes.append(Node(id=f"g_{g}", label=g, size=15, color="#f1c40f", shape="star"))
-                added.add(f"g_{g}")
-        for i, r in disp_df.iterrows():
-            edges.append(Edge(source=r['Artist'], target=f"g_{r['Genre']}", color="#333333"))
-    elif real_center:
+    if real_center:
         for i, r in disp_df.iterrows():
             if r['Artist'] != real_center:
                 edges.append(Edge(source=real_center, target=r['Artist'], color="#888888"))
@@ -352,8 +422,8 @@ if not disp_df.empty:
     config = Config(width="100%", height=600, directed=False, physics=True, hierarchical=False, collapsible=True)
     selected = agraph(nodes=nodes, edges=edges, config=config)
 
-# --- 9. DASHBOARD ---
-if selected and not selected.startswith("g_"):
+# --- 10. DASHBOARD ---
+if selected:
     st.divider()
     c1, c2 = st.columns([3, 1])
     with c1: st.header(f"🤿 {selected}")
@@ -361,7 +431,6 @@ if selected and not selected.startswith("g_"):
         if st.button("🔭 Travel Here", type="primary"):
             run_discovery(selected, "Artist", st.secrets["lastfm_key"], df_db)
             st.rerun()
-        
         if st.button("🤖 AI Neighbors"):
             ai_recs = get_ai_neighbors(selected, df_db)
             if not ai_recs.empty:
@@ -370,45 +439,38 @@ if selected and not selected.startswith("g_"):
                 st.success("AI Trajectory Calculated.")
                 time.sleep(1)
                 st.rerun()
-            else: st.error("Not enough data for AI analysis.")
+            else: st.error("Not enough data for AI.")
 
-    try:
-        row = df_db[df_db['Artist'] == selected]
-        img = row.iloc[0]['Image URL'] if not row.empty else None
-        
-        d_live = get_deezer_data(selected)
-        if not img or "placeholder" in str(img): 
-            if d_live: img = d_live['image']
-            
-        preview = None
-        if d_live and d_live.get('id'): preview = get_deezer_preview(d_live['id'])
-
+    row = df_db[df_db['Artist'] == selected]
+    if not row.empty:
+        r = row.iloc[0]
         col1, col2 = st.columns([1, 2])
         with col1:
-            if img and str(img).startswith("http"): st.image(img)
-            if preview: 
-                st.audio(preview['preview'])
-                st.caption(f"🎵 {preview['title']}")
+            st.image(r['Image URL'], width=200)
+            st.metric("BPM", int(r.get('Audio_BPM', 0)))
             
-            if not row.empty:
-                st.metric("Fans", f"{int(row.iloc[0]['Monthly Listeners']):,}")
-                e, v = float(row.iloc[0]['Energy']), float(row.iloc[0]['Valence'])
-                st.caption(f"🔥 Energy: {e:.2f}")
-                st.progress(e)
-                st.caption(f"😊 Mood: {v:.2f}")
-                st.progress(v)
+            audio_b = float(r.get('Audio_Brightness', 0))
+            tag_e = float(r.get('Tag_Energy', 0.5))
+            energy = audio_b if audio_b > 0 else tag_e
+            label = "Audio Brightness" if audio_b > 0 else "Tag Energy (Est.)"
+            
+            st.caption(label)
+            st.progress(energy)
+            
+            # Audio Preview
+            d_live = get_deezer_data(selected)
+            if d_live and d_live.get('id'):
+                prev = get_deezer_preview(d_live['id'])
+                if prev: st.audio(prev['preview'])
 
         with col2:
-            with st.spinner("Fetching info..."):
-                det = get_artist_details(selected, st.secrets["lastfm_key"])
-                trx = get_top_tracks(selected, st.secrets["lastfm_key"])
+            det = get_artist_details(selected, st.secrets["lastfm_key"])
+            trx = get_top_tracks(selected, st.secrets["lastfm_key"])
             
             if det and 'bio' in det: st.info(det['bio']['summary'].split("<a href")[0])
             if trx:
                 t_data = [{"Song": t['name'], "Plays": f"{int(t['playcount']):,}", "Link": t['url']} for t in trx]
                 st.dataframe(pd.DataFrame(t_data), column_config={"Link": st.column_config.LinkColumn("Link")}, hide_index=True)
-                
-    except Exception as e: st.error(f"Error: {e}")
 
 else:
     if df_db.empty:
