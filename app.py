@@ -68,8 +68,9 @@ def load_data():
     df = pd.DataFrame(data)
     
     # Handle empty DB
+    expected_cols = ['Artist', 'Genre', 'Monthly Listeners', 'Tag_Energy', 'Valence', 'Audio_BPM', 'Audio_Brightness', 'Image URL', 'Artist_Lower']
     if df.empty or 'Artist' not in df.columns:
-        return pd.DataFrame(columns=['Artist', 'Genre', 'Monthly Listeners', 'Tag_Energy', 'Valence', 'Audio_BPM', 'Audio_Brightness', 'Image URL', 'Artist_Lower'])
+        return pd.DataFrame(columns=expected_cols)
     
     # Fix Numbers
     cols_to_fix = ['Monthly Listeners', 'Tag_Energy', 'Valence', 'Audio_BPM', 'Audio_Brightness']
@@ -209,8 +210,10 @@ def get_artist_details(artist_name, api_key):
     try:
         response = requests.get(url, timeout=5)
         data = response.json()
-        if 'error' not in data: return data['artist']
-    except: pass
+        if 'error' not in data:
+            return data['artist']
+    except:
+        pass
     return None
 
 def get_top_tracks(artist_name, api_key):
@@ -218,8 +221,10 @@ def get_top_tracks(artist_name, api_key):
     try:
         response = requests.get(url, timeout=5)
         data = response.json()
-        if 'error' not in data: return data['toptracks']['track']
-    except: pass
+        if 'error' not in data:
+            return data['toptracks']['track']
+    except:
+        pass
     return []
 
 def get_deezer_data(artist_name):
@@ -233,7 +238,8 @@ def get_deezer_data(artist_name):
                 "name": artist['name'], "id": artist['id'], "listeners": artist['nb_fan'],
                 "image": artist['picture_medium'], "link": artist['link']
             }
-    except: pass
+    except:
+        pass
     return None
 
 def get_deezer_preview(artist_id):
@@ -244,7 +250,8 @@ def get_deezer_preview(artist_id):
         if data.get('data') and len(data['data']) > 0:
             track = data['data'][0]
             return { "title": track['title'], "preview": track['preview'] }
-    except: pass
+    except:
+        pass
     return None
 
 def process_artist(name, df_db, api_key, session_added_set):
@@ -328,6 +335,7 @@ def run_discovery(center, mode, api_key, df_db):
         prog.progress((i + 1) / len(set(targets)))
         data = process_artist(artist, df_db, api_key, session_added_set)
         if data: session_data.append(data)
+        if i % 3 == 0: df_db = load_data()
     
     if session_data:
         st.session_state.view_df = pd.DataFrame(session_data).drop_duplicates(subset=['Artist'])
@@ -338,7 +346,8 @@ def run_discovery(center, mode, api_key, df_db):
 # --- 7. INITIAL LOAD ---
 try:
     df_db = load_data()
-except:
+except Exception as e:
+    st.error(f"🚨 Startup Error: {e}")
     st.stop()
 
 # --- 8. SIDEBAR ---
@@ -422,7 +431,7 @@ if not disp_df.empty:
     selected = agraph(nodes=nodes, edges=edges, config=config)
 
 # --- 10. DASHBOARD ---
-if selected:
+if selected and not selected.startswith("g_"):
     st.divider()
     c1, c2 = st.columns([3, 1])
     with c1: st.header(f"🤿 {selected}")
@@ -438,38 +447,45 @@ if selected:
                 st.success("AI Trajectory Calculated.")
                 time.sleep(1)
                 st.rerun()
-            else: st.error("Not enough data.")
+            else: st.error("Not enough data for AI analysis.")
 
-    row = df_db[df_db['Artist'] == selected]
-    if not row.empty:
-        r = row.iloc[0]
+    try:
+        row = df_db[df_db['Artist'] == selected]
+        img = row.iloc[0]['Image URL'] if not row.empty else None
+        
+        d_live = get_deezer_data(selected)
+        if not img or "placeholder" in str(img): 
+            if d_live: img = d_live['image']
+            
+        preview = None
+        if d_live and d_live.get('id'): preview = get_deezer_preview(d_live['id'])
+
         col1, col2 = st.columns([1, 2])
         with col1:
-            st.image(r['Image URL'], width=200)
-            st.metric("BPM", int(r.get('Audio_BPM', 0)))
+            if img and str(img).startswith("http"): st.image(img)
+            if preview: 
+                st.audio(preview['preview'])
+                st.caption(f"🎵 {preview['title']}")
             
-            audio_b = float(r.get('Audio_Brightness', 0))
-            tag_e = float(r.get('Tag_Energy', 0.5))
-            energy = audio_b if audio_b > 0 else tag_e
-            label = "Audio Brightness" if audio_b > 0 else "Tag Energy (Est.)"
-            
-            st.caption(label)
-            st.progress(energy)
-            
-            # Audio Preview
-            d_live = get_deezer_data(selected)
-            if d_live and d_live.get('id'):
-                prev = get_deezer_preview(d_live['id'])
-                if prev: st.audio(prev['preview'])
+            if not row.empty:
+                st.metric("Fans", f"{int(row.iloc[0]['Monthly Listeners']):,}")
+                e, v = float(row.iloc[0]['Energy']), float(row.iloc[0]['Valence'])
+                st.caption(f"🔥 Energy: {e:.2f}")
+                st.progress(e)
+                st.caption(f"😊 Mood: {v:.2f}")
+                st.progress(v)
 
         with col2:
-            det = get_artist_details(selected, st.secrets["lastfm_key"])
-            tracks = get_top_tracks(selected, st.secrets["lastfm_key"])
+            with st.spinner("Fetching info..."):
+                det = get_artist_details(selected, st.secrets["lastfm_key"])
+                tracks = get_top_tracks(selected, st.secrets["lastfm_key"])
             
             if det and 'bio' in det: st.info(det['bio']['summary'].split("<a href")[0])
             if tracks:
                 t_data = [{"Song": t['name'], "Plays": f"{int(t['playcount']):,}", "Link": t['url']} for t in tracks]
                 st.dataframe(pd.DataFrame(t_data), column_config={"Link": st.column_config.LinkColumn("Link")}, hide_index=True)
+                
+    except Exception as e: st.error(f"Error: {e}")
 
 else:
     if df_db.empty:
