@@ -12,7 +12,6 @@ import librosa
 from google.oauth2.service_account import Credentials
 from streamlit_agraph import agraph, Node, Edge, Config
 import json
-# ML Imports
 from sklearn.preprocessing import StandardScaler
 from sklearn.neighbors import NearestNeighbors
 
@@ -114,10 +113,11 @@ def delete_artist(artist_name):
         st.error(f"Delete Error: {e}")
         return False
 
-# --- 3. AUDIO ENGINE (LIVE) ---
+# --- 3. AUDIO ENGINE (LIVE - DEBUG ENABLED) ---
 def analyze_audio(preview_url):
     """Downloads MP3 to temp file and extracts real physics."""
     tmp_path = None
+    # Use explicit browser headers to prevent 403 Forbidden errors
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
     }
@@ -128,7 +128,12 @@ def analyze_audio(preview_url):
         # 1. Download MP3
         response = requests.get(preview_url, headers=headers, verify=False, timeout=5)
         
-        # 2. Save to Temp File
+        if response.status_code != 200:
+            st.sidebar.warning(f"⚠️ Audio Download Failed: {response.status_code}")
+            return 0, 0
+
+        # 2. Save to Temp File (Windows Safe Method)
+        # delete=False is required on Windows so we can close the file handle before Librosa opens it
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
             tmp.write(response.content)
             tmp_path = tmp.name
@@ -140,7 +145,7 @@ def analyze_audio(preview_url):
         onset_env = librosa.onset.onset_strength(y=y, sr=sr)
         tempo = librosa.beat.tempo(onset_envelope=onset_env, sr=sr)
         
-        # FIX: Handle Array vs Float return types safely
+        # Handle varied return types from librosa versions
         if isinstance(tempo, np.ndarray):
             bpm = round(float(tempo[0]))
         elif isinstance(tempo, list):
@@ -155,9 +160,11 @@ def analyze_audio(preview_url):
         return bpm, round(norm_brightness, 2)
 
     except Exception as e:
-        # print(f"Audio Error: {e}") # Uncomment for local debugging
+        # PRINT THE ERROR TO SIDEBAR SO WE CAN SEE IT
+        st.sidebar.warning(f"⚠️ Librosa Error: {e}")
         return 0, 0 
     finally:
+        # 5. Cleanup
         if tmp_path and os.path.exists(tmp_path):
             try: os.remove(tmp_path)
             except: pass
@@ -214,10 +221,8 @@ def get_artist_details(artist_name, api_key):
     try:
         response = requests.get(url, timeout=5)
         data = response.json()
-        if 'error' not in data:
-            return data['artist']
-    except:
-        pass
+        if 'error' not in data: return data['artist']
+    except: pass
     return None
 
 def get_top_tracks(artist_name, api_key):
@@ -225,10 +230,8 @@ def get_top_tracks(artist_name, api_key):
     try:
         response = requests.get(url, timeout=5)
         data = response.json()
-        if 'error' not in data:
-            return data['toptracks']['track']
-    except:
-        pass
+        if 'error' not in data: return data['toptracks']['track']
+    except: pass
     return []
 
 def get_deezer_data(artist_name):
@@ -242,8 +245,7 @@ def get_deezer_data(artist_name):
                 "name": artist['name'], "id": artist['id'], "listeners": artist['nb_fan'],
                 "image": artist['picture_medium'], "link": artist['link']
             }
-    except:
-        pass
+    except: pass
     return None
 
 def get_deezer_preview(artist_id):
@@ -254,8 +256,7 @@ def get_deezer_preview(artist_id):
         if data.get('data') and len(data['data']) > 0:
             track = data['data'][0]
             return { "title": track['title'], "preview": track['preview'] }
-    except:
-        pass
+    except: pass
     return None
 
 def process_artist(name, df_db, api_key, session_added_set):
@@ -298,6 +299,8 @@ def process_artist(name, df_db, api_key, session_added_set):
         real_bpm = 0
         real_brightness = 0
         if deezer_info and deezer_info.get('preview'):
+            # DEBUG: Print to sidebar if we are attempting analysis
+            # st.sidebar.write(f"Analyzing {clean_name}...") 
             real_bpm, real_brightness = analyze_audio(deezer_info['preview'])
         
         if real_bpm == 0: 
@@ -339,7 +342,6 @@ def run_discovery(center, mode, api_key, df_db):
         prog.progress((i + 1) / len(set(targets)))
         data = process_artist(artist, df_db, api_key, session_added_set)
         if data: session_data.append(data)
-        if i % 3 == 0: df_db = load_data()
     
     if session_data:
         st.session_state.view_df = pd.DataFrame(session_data).drop_duplicates(subset=['Artist'])
@@ -435,7 +437,7 @@ if not disp_df.empty:
     selected = agraph(nodes=nodes, edges=edges, config=config)
 
 # --- 10. DASHBOARD ---
-if selected and not selected.startswith("g_"):
+if selected:
     st.divider()
     c1, c2 = st.columns([3, 1])
     with c1: st.header(f"🤿 {selected}")
@@ -451,45 +453,37 @@ if selected and not selected.startswith("g_"):
                 st.success("AI Trajectory Calculated.")
                 time.sleep(1)
                 st.rerun()
-            else: st.error("Not enough data for AI analysis.")
+            else: st.error("Not enough data.")
 
-    try:
-        row = df_db[df_db['Artist'] == selected]
-        img = row.iloc[0]['Image URL'] if not row.empty else None
-        
-        d_live = get_deezer_data(selected)
-        if not img or "placeholder" in str(img): 
-            if d_live: img = d_live['image']
-            
-        preview = None
-        if d_live and d_live.get('id'): preview = get_deezer_preview(d_live['id'])
-
+    row = df_db[df_db['Artist'] == selected]
+    if not row.empty:
+        r = row.iloc[0]
         col1, col2 = st.columns([1, 2])
         with col1:
-            if img and str(img).startswith("http"): st.image(img)
-            if preview: 
-                st.audio(preview['preview'])
-                st.caption(f"🎵 {preview['title']}")
+            st.image(r['Image URL'], width=200)
+            st.metric("BPM", int(r.get('Audio_BPM', 0)))
             
-            if not row.empty:
-                st.metric("Fans", f"{int(row.iloc[0]['Monthly Listeners']):,}")
-                e, v = float(row.iloc[0]['Energy']), float(row.iloc[0]['Valence'])
-                st.caption(f"🔥 Energy: {e:.2f}")
-                st.progress(e)
-                st.caption(f"😊 Mood: {v:.2f}")
-                st.progress(v)
+            audio_b = float(r.get('Audio_Brightness', 0))
+            tag_e = float(r.get('Tag_Energy', 0.5))
+            energy = audio_b if audio_b > 0 else tag_e
+            label = "Audio Brightness" if audio_b > 0 else "Tag Energy (Est.)"
+            
+            st.caption(label)
+            st.progress(energy)
+            
+            # Audio Preview
+            d_live = get_deezer_data(selected)
+            if d_live and d_live.get('id'):
+                prev = get_deezer_preview(d_live['id'])
+                if prev: st.audio(prev['preview'])
 
         with col2:
-            with st.spinner("Fetching info..."):
-                det = get_artist_details(selected, st.secrets["lastfm_key"])
-                tracks = get_top_tracks(selected, st.secrets["lastfm_key"])
-            
+            det = get_artist_details(selected, st.secrets["lastfm_key"])
+            tracks = get_top_tracks(selected, st.secrets["lastfm_key"])
             if det and 'bio' in det: st.info(det['bio']['summary'].split("<a href")[0])
             if tracks:
                 t_data = [{"Song": t['name'], "Plays": f"{int(t['playcount']):,}", "Link": t['url']} for t in tracks]
                 st.dataframe(pd.DataFrame(t_data), column_config={"Link": st.column_config.LinkColumn("Link")}, hide_index=True)
-                
-    except Exception as e: st.error(f"Error: {e}")
 
 else:
     if df_db.empty:
