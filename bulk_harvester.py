@@ -12,8 +12,8 @@ import librosa
 from google.oauth2.service_account import Credentials
 
 # --- CONFIGURATION ---
-BATCH_SIZE = 5    
-SLEEP_TIME = 1.0  
+BATCH_SIZE = 5    # Saving frequently is safer
+SLEEP_TIME = 1.0  # Respect API limits
 SEARCH_LIMIT = 50 
 MAX_PAGES = 3     
 SEED_ARTISTS = ["Metallica", "The Beatles", "Gorillaz", "Chris Stapleton", "Dolly Parton"]
@@ -22,14 +22,38 @@ SEED_ARTISTS = ["Metallica", "The Beatles", "Gorillaz", "Chris Stapleton", "Doll
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- 1. SETUP AUTH ---
-secrets = toml.load(".streamlit/secrets.toml")
-API_KEY = secrets["lastfm_key"]
-GCP_SECRETS = secrets["gcp_service_account"]
+SECRETS_PATH = ".streamlit/secrets.toml"
+try:
+    secrets = toml.load(SECRETS_PATH)
+    API_KEY = secrets["lastfm_key"]
+    GCP_SECRETS = secrets["gcp_service_account"]
+except Exception as e:
+    print(f"❌ Error loading secrets: {e}")
+    exit()
 
 def get_sheet_connection():
     scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-    private_key_fixed = GCP_SECRETS["private_key"].replace('\\n', '\n')
-    creds_info = {**GCP_SECRETS, "private_key": private_key_fixed}
+    
+    # FIX: Explicitly fix line breaks in the key before use
+    private_key_string = GCP_SECRETS["private_key"]
+    if "\\n" in private_key_string:
+        fixed_private_key = private_key_string.replace('\\n', '\n')
+    else:
+        fixed_private_key = private_key_string
+        
+    creds_info = {
+        "type": GCP_SECRETS["type"],
+        "project_id": GCP_SECRETS["project_id"],
+        "private_key_id": GCP_SECRETS["private_key_id"],
+        "private_key": fixed_private_key,
+        "client_email": GCP_SECRETS["client_email"],
+        "client_id": GCP_SECRETS["client_id"],
+        "auth_uri": GCP_SECRETS["auth_uri"],
+        "token_uri": GCP_SECRETS["token_uri"],
+        "auth_provider_x509_cert_url": GCP_SECRETS["auth_provider_x509_cert_url"],
+        "client_x509_cert_url": GCP_SECRETS["client_x509_cert_url"],
+    }
+    
     creds = Credentials.from_service_account_info(creds_info, scopes=scope)
     client = gspread.authorize(creds)
     return client.open("tu-nerr-db").sheet1
@@ -38,14 +62,21 @@ def load_current_db():
     sheet = get_sheet_connection()
     data = sheet.get_all_records()
     df = pd.DataFrame(data)
-    if df.empty or 'Audio_BPM' not in df.columns:
-        return pd.DataFrame(columns=['Artist', 'Genre', 'Monthly Listeners', 'Tag_Energy', 'Valence', 'Audio_BPM', 'Audio_Brightness', 'Image URL'])
+    
+    # SCHEMA CHECK: Ensure we have the new columns
+    expected_cols = ['Artist', 'Genre', 'Monthly Listeners', 'Tag_Energy', 'Valence', 'Audio_BPM', 'Audio_Brightness', 'Image URL']
+    if df.empty or 'Artist' not in df.columns:
+        return pd.DataFrame(columns=expected_cols)
+        
     return df
 
 def append_to_sheet(new_rows_df):
     sheet = get_sheet_connection()
+    
+    # If sheet is empty, write headers first
     if len(sheet.get_all_values()) == 0:
         sheet.append_row(new_rows_df.columns.tolist())
+        
     values = new_rows_df.values.tolist()
     sheet.append_rows(values)
     print(f"💾 Batch Saved: {len(values)} artists added to Cloud.")
@@ -54,8 +85,6 @@ def append_to_sheet(new_rows_df):
 def analyze_audio(preview_url):
     """Downloads MP3 to temp file to fix Windows read errors."""
     tmp_path = None
-    
-    # FAKE BROWSER HEADER (Prevents hanging)
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
     }
@@ -64,7 +93,7 @@ def analyze_audio(preview_url):
         if not preview_url: return 0, 0
         
         # 1. Download MP3 with Strict Timeout
-        response = requests.get(preview_url, headers=headers, verify=False, timeout=5)
+        response = requests.get(preview_url, headers=headers, verify=False, timeout=10)
         
         # 2. Save to Temp File
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
@@ -72,16 +101,16 @@ def analyze_audio(preview_url):
             tmp_path = tmp.name
         
         # 3. Load into Librosa
-        # Use 'kaiser_fast' for speed, mono=True
         y, sr = librosa.load(tmp_path, duration=30, sr=22050, mono=True)
         
         # 4. Extract Features
         onset_env = librosa.onset.onset_strength(y=y, sr=sr)
         tempo = librosa.beat.tempo(onset_envelope=onset_env, sr=sr)
         
-        # Handle array return type from newer librosa versions
         if isinstance(tempo, np.ndarray):
             bpm = round(float(tempo[0]))
+        elif isinstance(tempo, list):
+             bpm = round(float(tempo[0]))
         else:
             bpm = round(float(tempo))
             
@@ -92,7 +121,7 @@ def analyze_audio(preview_url):
         return bpm, round(norm_brightness, 2)
 
     except Exception as e:
-        # print(f"      ⚠️ Audio skipped: {e}") # Uncomment to debug specific audio errors
+        # print(f"      ⚠️ Audio skipped: {e}") 
         return 0, 0 
     finally:
         # 5. Cleanup
@@ -138,8 +167,8 @@ def get_details_and_audio(artist):
     except: return None
 
     # 3. Scoring
-    VALENCE_SCORES = {'happy': 0.9, 'party': 0.9, 'dance': 0.85, 'pop': 0.8, 'upbeat': 0.8, 'funk': 0.75, 'soul': 0.7, 'country': 0.6, 'folk': 0.5, 'progressive': 0.5, 'rock': 0.45, 'sad': 0.2, 'dark': 0.15, 'doom': 0.1, 'gothic': 0.2, 'industrial': 0.3, 'angry': 0.3, 'metal': 0.3, 'heavy': 0.3, 'thrash': 0.2, 'death': 0.1}
-    ENERGY_SCORES = {'death': 1.0, 'metal': 0.9, 'punk': 0.9, 'rock': 0.7, 'pop': 0.6, 'acoustic': 0.2} 
+    ENERGY_SCORES = {'death': 1.0, 'thrash': 0.95, 'core': 0.95, 'metal': 0.9, 'punk': 0.9, 'heavy': 0.9, 'industrial': 0.85, 'hard rock': 0.8, 'hip hop': 0.75, 'rock': 0.7, 'electronic': 0.65, 'pop': 0.6, 'indie': 0.5, 'alternative': 0.5, 'folk': 0.3, 'soul': 0.3, 'country': 0.4, 'jazz': 0.35, 'ambient': 0.1, 'acoustic': 0.2, 'classical': 0.15}
+    VALENCE_SCORES = {'happy': 0.9, 'party': 0.9, 'dance': 0.85, 'pop': 0.8, 'upbeat': 0.8, 'funk': 0.75, 'soul': 0.7, 'country': 0.6, 'folk': 0.5, 'progressive': 0.5, 'alternative': 0.4, 'rock': 0.45, 'sad': 0.2, 'dark': 0.15, 'melancholic': 0.1, 'depressive': 0.05, 'doom': 0.1, 'gothic': 0.2, 'industrial': 0.3, 'angry': 0.3, 'metal': 0.3, 'heavy': 0.3, 'thrash': 0.2, 'death': 0.1}
 
     def calc_score(t_list, s_dict):
         scores = [score for tag, score in s_dict.items() for t in t_list if tag in t]
@@ -153,7 +182,8 @@ def get_details_and_audio(artist):
     real_bpm, real_brightness = analyze_audio(preview_url)
     print(f" Done. (BPM: {real_bpm})")
     
-    if real_bpm == 0: real_brightness = tag_energy 
+    if real_bpm == 0: 
+        real_brightness = tag_energy # Fallback
 
     return {
         "Artist": d_data['name'], 
@@ -170,8 +200,13 @@ def get_details_and_audio(artist):
 def run_bulk_harvest():
     print(f"🚀 Starting Audio-Visual Harvest...")
     
-    df = load_current_db()
-    
+    try:
+        df = load_current_db()
+    except Exception as e:
+        print(f"❌ Database Connection Error: {e}")
+        return
+
+    # Initialize with SEED if empty
     if df.empty or len(df) <= 1:
         print("🚨 Database empty. Initializing with SEED ARTISTS.")
         source_artists = SEED_ARTISTS
@@ -180,7 +215,7 @@ def run_bulk_harvest():
         source_artists = df['Artist'].tolist()
         existing_artists = set(df['Artist'].astype(str).str.strip().str.lower().tolist())
     
-    print(f"📚 Loaded {len(existing_artists)} artists.")
+    print(f"📚 Loaded {len(existing_artists)} existing artists.")
     
     new_batch = []
     total_added = 0
@@ -196,8 +231,12 @@ def run_bulk_harvest():
 
             for candidate in candidates:
                 if added_for_this_seed >= 2: break
+                
                 if candidate.strip().lower() in existing_artists: continue
                     
+                # Check if already in current batch to avoid duplicate work
+                if any(b['Artist'].lower() == candidate.strip().lower() for b in new_batch): continue
+
                 print(f"   ✨ Found candidate: {candidate}")
                 data = get_details_and_audio(candidate)
                 time.sleep(SLEEP_TIME)
@@ -212,7 +251,7 @@ def run_bulk_harvest():
             
             page += 1
             
-        # Save immediately if we have enough, OR if we just finished a seed artist loop
+        # Save batch
         if len(new_batch) >= BATCH_SIZE:
             append_to_sheet(pd.DataFrame(new_batch))
             new_batch = []

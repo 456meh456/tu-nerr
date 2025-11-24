@@ -140,7 +140,10 @@ def analyze_audio(preview_url):
         onset_env = librosa.onset.onset_strength(y=y, sr=sr)
         tempo = librosa.beat.tempo(onset_envelope=onset_env, sr=sr)
         
+        # FIX: Handle Array vs Float return types safely
         if isinstance(tempo, np.ndarray):
+            bpm = round(float(tempo[0]))
+        elif isinstance(tempo, list):
             bpm = round(float(tempo[0]))
         else:
             bpm = round(float(tempo))
@@ -152,6 +155,7 @@ def analyze_audio(preview_url):
         return bpm, round(norm_brightness, 2)
 
     except Exception as e:
+        # print(f"Audio Error: {e}") # Uncomment for local debugging
         return 0, 0 
     finally:
         if tmp_path and os.path.exists(tmp_path):
