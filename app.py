@@ -104,20 +104,28 @@ with st.sidebar:
 # --- 3. VISUALIZATION CONTROLLER ---
 if 'view_df' not in st.session_state or st.session_state.view_df.empty:
     if not df_db.empty:
-        # GLOBAL VIEW: Calculate UMAP Territory
-        with st.spinner("Calculating AI Territory Map..."):
-            # Call the UMAP function here
-            # This logic provides the initial state: the global territory map
-            st.session_state.view_df = generate_territory_map(df_db)
+        # FIX: Random Sample for initial load (Local Neighborhood View)
+        sample_size = min(len(df_db), 30)
         
-        st.session_state.center_node = None
-        st.session_state.view_source = "Global AI"
+        # 1. Get the random sample and anchor it to the most popular artist found
+        sample_df = df_db.sample(n=sample_size)
+        
+        st.session_state.view_df = sample_df
+        st.session_state.center_node = sample_df.sort_values('Monthly Listeners', ascending=False).iloc[0]['Artist']
+        st.session_state.view_source = "Random Cluster"
     else:
         st.session_state.view_df = pd.DataFrame()
 
 disp_df = st.session_state.view_df
 center = st.session_state.get('center_node', 'Unknown')
 source = st.session_state.get('view_source', 'Social')
+
+# Add explicit check for the Global UMAP View Button (currently disabled)
+if source == "Global AI" and not df_db.empty:
+    with st.spinner("Calculating UMAP Territory Map..."):
+        # This calculates the full AI territory map for the global view
+        disp_df = generate_territory_map(df_db)
+
 
 st.subheader(f"🔭 System: {center if center else 'Universal Galaxy'} ({source} Connection)")
 
@@ -205,7 +213,7 @@ if selected:
                 st.info(det['bio']['summary'].split("<a href")[0])
             
             if tracks:
-                t_data = [{"Song": t['name'], "Plays": f"{int(t['playcount']):,}", "Link": t.get('url', '#')}] # Added .get('url', '#') for robustness
+                t_data = [{"Song": t['name'], "Plays": f"{int(t['playcount']):,}", "Link": t.get('url', '#')} for t in tracks]
                 st.dataframe(pd.DataFrame(t_data), column_config={"Link": st.column_config.LinkColumn("Listen")}, hide_index=True)
 
     except Exception as e:
