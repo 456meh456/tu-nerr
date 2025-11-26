@@ -1,285 +1,219 @@
-import requests
-import time
-import urllib3
-import os
-import tempfile
-import numpy as np
-import librosa
+import streamlit as st
 import pandas as pd
-import random
-from src.db_model import add_artist, add_track, synthesize_scores, fetch_all_artists_df
+import time
 
-# --- CONFIGURATION ---
-SLEEP_TIME = 1.0  # Seconds between API calls to be polite
-SEARCH_LIMIT = 50 # Neighbors to scan
-MAX_PAGES = 3     
-TRACKS_TO_ANALYZE = 5 # How many songs to listen to per band
-MAX_SEEDS_PER_RUN = 20 # Prevents the script from taking forever as DB grows
+# --- IMPORT MODULES ---
+from src.db_model import fetch_all_artists_df, delete_artist
+from src.api_handler import get_similar_artists, get_top_artists_by_genre, process_artist, get_artist_details, get_top_tracks, get_deezer_data, get_deezer_preview
+from src.ai_engine import get_ai_neighbors, generate_territory_map
+from src.visuals import render_graph 
 
-# Seed list for cold start
-SEED_ARTISTS = ["Metallica", "The Beatles", "Gorillaz", "Chris Stapleton", "Dolly Parton"]
+# --- PAGE CONFIGURATION ---
+st.set_page_config(layout="wide", page_title="tu-nerr")
+st.title("🎵 tu-nerr: The Discovery Engine")
 
-# Disable SSL warnings for the requests library
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# --- CORE LOGIC FLOW ---
 
-# Load Secrets for API Keys
-import toml
-SECRETS_PATH = ".streamlit/secrets.toml"
-try:
-    secrets = toml.load(SECRETS_PATH)
-    API_KEY = secrets["lastfm_key"]
-except Exception as e:
-    print(f"❌ Error loading secrets: {e}")
-    exit()
-
-# --- 1. AUDIO ANALYSIS ENGINE (LIBROSA) ---
-def analyze_audio(preview_url):
-    """Downloads MP3 to temp file and extracts 5-dimensional physics."""
-    tmp_path = None
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-    
-    try:
-        if not preview_url: return None
-        
-        # 1. Download
-        response = requests.get(preview_url, headers=headers, verify=False, timeout=10)
-        if response.status_code != 200: return None
-
-        # 2. Save to Temp (Windows fix)
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
-            tmp.write(response.content)
-            tmp_path = tmp.name
-        
-        # 3. Load Audio
-        y, sr = librosa.load(tmp_path, duration=30, sr=22050, mono=True)
-        
-        # 4. Extract Physics
-        onset_env = librosa.onset.onset_strength(y=y, sr=sr)
-        tempo = librosa.beat.tempo(onset_envelope=onset_env, sr=sr)
-        bpm = round(float(tempo[0])) if isinstance(tempo, np.ndarray) else round(float(tempo))
-            
-        spectral_centroids = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
-        brightness = np.mean(spectral_centroids)
-        norm_brightness = min(brightness / 3000, 1.0)
-
-        zcr = np.mean(librosa.feature.zero_crossing_rate(y))
-        norm_noise = min(zcr * 10, 1.0) 
-
-        rolloff = np.mean(librosa.feature.spectral_rolloff(y=y, sr=sr, roll_percent=0.85)[0])
-        norm_warmth = min(rolloff / 5000, 1.0)
-
-        chroma = librosa.feature.chroma_stft(y=y, sr=sr)
-        complexity = np.mean(np.std(chroma, axis=1))
-        norm_complexity = min(complexity * 5, 1.0)
-        
-        return {
-            "bpm": bpm, "brightness": norm_brightness, "noisiness": norm_noise, 
-            "warmth": norm_warmth, "complexity": norm_complexity
-        }
-
-    except Exception: return None
-    finally:
-        if 'tmp_path' in locals() and os.path.exists(tmp_path):
-            try: os.remove(tmp_path)
-            except: pass
-
-# --- 2. API HELPERS ---
-def get_neighbors(artist, limit=50, page=1):
-    url = f"http://ws.audioscrobbler.com/2.0/?method=artist.getsimilar&artist={artist}&api_key={API_KEY}&limit={limit}&page={page}&format=json"
-    try:
-        resp = requests.get(url, verify=False, timeout=5).json()
-        return [a['name'] for a in resp['similarartists']['artist']] if 'similarartists' in resp else []
-    except: return []
-
-def get_release_year(artist_id):
-    """
-    FIX: Fetches the full discography and finds the absolute earliest release year
-    by iterating through the album list and finding the minimum date.
-    """
-    try:
-        url = f"https://api.deezer.com/artist/{artist_id}/albums?limit=50"
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        resp = requests.get(url, headers=headers, verify=False, timeout=5).json()
-        
-        if 'data' in resp:
-            # Extract all valid release dates and sort them
-            dates = [album.get('release_date') for album in resp['data'] if album.get('release_date')]
-            
-            if not dates: return 0
-                 
-            # Find the minimum date string (earliest) and extract the year
-            earliest_date = min(dates)
-            return int(earliest_date[:4])
-
-    except:
-        return 0
-
-def get_deezer_data(artist_name):
-    """Fetches Deezer ID, Listeners, Image, and Preview URL."""
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-    try:
-        # 1. Search Artist
-        url = f"https://api.deezer.com/search/artist?q={artist_name}"
-        response = requests.get(url, headers=headers, verify=False, timeout=5)
-        if response.status_code != 200 or not response.json().get('data'): return None
-        artist = response.json()['data'][0]
-        
-        # 2. Get Top Track Preview URL
-        track_url = f"https://api.deezer.com/artist/{artist['id']}/top?limit=1"
-        t_data = requests.get(track_url, headers=headers, verify=False, timeout=5).json()
-        preview = t_data['data'][0]['preview'] if t_data.get('data') else None
-
-        return {
-            "name": artist['name'], "id": artist['id'], "listeners": artist['nb_fan'],
-            "image": artist['picture_medium'], "link": artist['link'], "preview": preview,
-        }
-    except: return None
-
-def get_top_tracks_previews(deezer_id):
-    """Fetches top tracks for analysis."""
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    try:
-        url = f"https://api.deezer.com/artist/{deezer_id}/top?limit={TRACKS_TO_ANALYZE}"
-        resp = requests.get(url, headers=headers, verify=False, timeout=5).json()
-        
-        tracks = []
-        if resp.get('data'):
-            for t in resp['data']:
-                if 'preview' in t and t['preview']:
-                    tracks.append({"title": t['title'], "preview": t['preview']})
-        return tracks
-    except: return []
-
-def get_lastfm_tags(artist_name):
-    try:
-        url = f"http://ws.audioscrobbler.com/2.0/?method=artist.getinfo&artist={artist_name}&api_key={API_KEY}&format=json"
-        resp = requests.get(url, verify=False, timeout=5).json()
-        if 'error' in resp: return [], 0.5, 0.5
-        
-        tags = [t['name'].lower() for t in resp['artist']['tags']['tag']]
-        
-        # Scoring Logic for Vibe
-        VALENCE_SCORES = {'happy': 0.9, 'party': 0.9, 'dance': 0.85, 'pop': 0.8, 'upbeat': 0.8, 'funk': 0.75, 'soul': 0.7, 'country': 0.6, 'folk': 0.5, 'progressive': 0.5, 'rock': 0.45, 'sad': 0.2, 'dark': 0.15, 'doom': 0.1, 'gothic': 0.2, 'industrial': 0.3, 'angry': 0.3, 'metal': 0.3, 'heavy': 0.3, 'thrash': 0.2, 'death': 0.1}
-        ENERGY_SCORES = {'death': 1.0, 'metal': 0.9, 'punk': 0.9, 'rock': 0.7, 'pop': 0.6, 'acoustic': 0.2}
-        
-        def score(d):
-            hits = [v for k,v in d.items() for t in tags if k in t]
-            return sum(hits)/len(hits) if hits else 0.5
-            
-        return tags, score(ENERGY_SCORES), score(VALENCE_SCORES)
-    except: return [], 0.5, 0.5
-
-# --- 3. CORE PROCESSOR (SQL EDITION) ---
-def process_artist_sql(name):
-    # 1. Fetch Metadata
-    d_info = get_deezer_data(name)
-    if not d_info: return None
-    
-    clean_name = d_info['name']
-    tags, tag_energy, valence = get_lastfm_tags(clean_name)
-    main_genre = tags[0].title() if tags else "Unknown"
-
-    # CRITICAL FIX: Get the Release Year based on the Artist ID
-    release_year = 0
-    if d_info.get('id'):
-        release_year = get_release_year(d_info['id'])
-    
-    # 2. Create Artist in SQL (Parent Record)
-    artist_data = {
-        "Artist": clean_name,
-        "Genre": main_genre,
-        "Monthly Listeners": d_info['listeners'],
-        "Image URL": d_info['image'],
-        "Valence": valence,
-        "Tag_Energy": tag_energy,
-        "First Release Year": release_year # <-- NOW CORRECTLY FETCHED
-    }
-    
-    # This inserts the artist and gets the Primary Key ID (Upsert logic in db_model)
-    artist_id = add_artist(artist_data)
-    
-    # 3. Process Tracks (Child Records)
-    tracks = get_top_tracks_previews(d_info['id'])
-    analyzed_count = 0
-    
-    print(f"      🎧 Analyzing {len(tracks)} tracks for physics...")
-    
-    for t in tracks:
-        audio_features = analyze_audio(t['preview'])
-        if audio_features:
-            track_record = {**t, **audio_features, "title": t['title']}
-            add_track(artist_id, track_record)
-            analyzed_count += 1
-            print(f"         - {t['title']} (BPM: {audio_features['bpm']})")
-            time.sleep(0.5)
-    
-    # 4. Synthesize (Trigger SQL Average Calculation)
-    if analyzed_count > 0:
-        synthesize_scores(artist_id)
-        print(f"      ⚗️ Scores synthesized and profile updated.")
-    
-    return clean_name
-
-# --- 4. MAIN LOOP ---
-def run_bulk_harvest():
-    print(f"🚀 Starting SQL-Powered Harvest...")
-    
-    # Get current list from SQL to avoid duplicates
-    try:
-        df = fetch_all_artists_df()
-    except Exception as e:
-        print(f"Error connecting to DB: {e}")
-        df = pd.DataFrame()
-    
-    if df.empty:
-        print("🚨 Database empty. Initializing with SEED ARTISTS.")
-        source_artists = SEED_ARTISTS
-        existing_artists = set()
-    else:
-        # SAMPLING LOGIC
-        full_list = df['Artist'].tolist()
-        if len(full_list) > MAX_SEEDS_PER_RUN:
-            print(f"🎲 Database large. Sampling {MAX_SEEDS_PER_RUN} random artists to expand frontier.")
-            source_artists = random.sample(full_list, MAX_SEEDS_PER_RUN)
+def run_discovery(center, mode, api_key, df_db):
+    """Central logic for finding and processing a cluster of artists."""
+    targets = []
+    with st.spinner(f"Scanning: {center}..."):
+        if mode == "Artist":
+            targets.append(center) # The center node itself
+            similar = get_similar_artists(center, api_key, limit=20) 
+            targets.extend(similar)
         else:
-            source_artists = full_list
-            
-        existing_artists = set(df['Artist'].str.lower().tolist())
+            targets = get_top_artists_by_genre(center, api_key, limit=20)
     
-    print(f"📚 Loaded {len(existing_artists)} existing artists. Expanding from {len(source_artists)} seeds.")
-    
-    total_added = 0
-    
-    for seed_artist in source_artists:
-        print(f"🔍 Scanning neighbors of: {seed_artist}...")
-        
-        added_for_this_seed = 0
-        page = 1
-        
-        while added_for_this_seed < 2 and page <= MAX_PAGES:
-            candidates = get_neighbors(seed_artist, limit=SEARCH_LIMIT, page=page)
-            
-            if not candidates: break
+    targets = list(set(targets)) # Deduplicate initial targets
 
-            for cand in candidates:
-                if added_for_this_seed >= 2: break
-                
-                if cand.lower() in existing_artists: continue
-                
-                # Run the SQL Processor
-                result_name = process_artist_sql(cand)
-                
-                if result_name:
-                    existing_artists.add(result_name.lower())
-                    added_for_this_seed += 1
-                    total_added += 1
-                    print(f"   ✅ COMMITTED: {result_name}")
-                
-                time.sleep(SLEEP_TIME)
-            
-            page += 1
+    session_data = []
+    prog = st.progress(0)
+    
+    # Create a set of existing lowercase names to prevent re-processing known bands during this session
+    session_added_set = set(df_db['Artist_Lower'].tolist()) if not df_db.empty else set()
         
-    print(f"🎉 Job Complete! Added {total_added} new artists.")
+    for i, artist in enumerate(targets):
+        prog.progress((i + 1) / len(targets))
+        
+        # Process: Checks DB -> Fetches API -> Analyzes Audio -> Saves to SQL
+        data = process_artist(artist, df_db, api_key, session_added_set)
+        if data: 
+            session_data.append(data)
+    
+    if session_data:
+        st.session_state.view_df = pd.DataFrame(session_data).drop_duplicates(subset=['Artist'])
+        
+        # Set the center node explicitly after a successful search
+        if mode == "Artist":
+            st.session_state.center_node = center
+        else:
+            st.session_state.center_node = None # For Genre searches
+            
+        st.session_state.view_source = "Social"
+        return True
+    return False
 
-if __name__ == "__main__":
-    run_bulk_harvest()
+# --- 1. INITIAL LOAD ---
+try:
+    df_db = fetch_all_artists_df()
+except Exception as e:
+    st.error(f"FATAL DB ERROR: Failed to load initial data. Details: {e}")
+    st.stop()
+
+# --- 2. INITIAL VIEW STATE CHECK ---
+if 'initial_run_complete' not in st.session_state:
+    st.session_state.initial_run_complete = False
+
+if 'view_df' not in st.session_state and not st.session_state.initial_run_complete:
+    if not df_db.empty:
+        # FIX: Random Entry Point - Trigger a discovery run if the map is empty
+        sample_df = df_db.sample(min(len(df_db), 30))
+        random_center = sample_df.sort_values('Monthly Listeners', ascending=False).iloc[0]['Artist']
+        
+        try:
+            key = st.secrets["lastfm_key"]
+            st.cache_data.clear() 
+            if run_discovery(random_center, "Artist", key, df_db):
+                 st.session_state.initial_run_complete = True
+                 st.rerun()
+            else:
+                 st.session_state.initial_run_complete = True
+                 st.error("Initial load failed to find neighbors for anchor artist. Try searching.")
+
+        except Exception as e:
+             st.error(f"Initial Load Discovery Failed: {e}")
+             st.session_state.view_df = pd.DataFrame() 
+    else:
+        st.session_state.view_df = pd.DataFrame()
+
+# --- 3. SIDEBAR (CONTROLS) ---
+with st.sidebar:
+    st.header("🚀 Discovery Engine")
+    
+    if st.button("🔄 Refresh Data"):
+        st.cache_data.clear()
+        st.rerun()
+
+    with st.form(key='search'):
+        mode = st.radio("Search By:", ["Artist", "Genre"])
+        query = st.text_input(f"Enter {mode} Name:")
+        if st.form_submit_button("Launch"):
+            if query:
+                try:
+                    key = st.secrets["lastfm_key"]
+                    st.cache_data.clear() 
+                    if run_discovery(query, mode, key, df_db): st.rerun()
+                    else: st.error("No data found.")
+                except Exception as e: st.error(f"Search error: {e}")
+    
+    st.divider()
+    if st.button("🔄 Reset Map"):
+        if 'view_df' in st.session_state: del st.session_state['view_df']
+        if 'center_node' in st.session_state: del st.session_state['center_node']
+        st.rerun()
+
+    # --- ADMIN ZONE (Janitor) ---
+    with st.expander("🔐 Admin"):
+        pw = st.text_input("Password:", type="password")
+        if pw and pw == st.secrets.get("admin_password", ""):
+            options = df_db['Artist'].sort_values().unique() if not df_db.empty else []
+            artist_del = st.selectbox("Delete Artist", options)
+            
+            if st.button("Delete"):
+                if delete_artist(artist_del):
+                    st.success(f"Deleted {artist_del}")
+                    time.sleep(1)
+                    st.cache_data.clear()
+                    st.rerun()
+                else:
+                    st.error("Delete failed.")
+
+# --- 4. VISUALIZATION CONTROLLER ---
+disp_df = st.session_state.view_df
+center = st.session_state.get('center_node', 'Unknown')
+source = st.session_state.get('view_source', 'Social')
+
+st.subheader(f"🔭 System: {center if center else 'Universal Galaxy'} ({source} Connection)")
+
+selected = None
+if not disp_df.empty:
+    selected = render_graph(disp_df, center, source)
+
+# --- 5. DASHBOARD ---
+if selected:
+    st.divider()
+    c1, c2 = st.columns([3, 1])
+    with c1: st.header(f"🤿 {selected}")
+    with c2:
+        if st.button("🔭 Travel Here (Social)", type="primary"):
+            run_discovery(selected, "Artist", st.secrets["lastfm_key"], df_db)
+            st.rerun()
+            
+        if st.button("🤖 AI Neighbors"):
+            ai_recs = get_ai_neighbors(selected, df_db)
+            if not ai_recs.empty:
+                st.session_state.view_df = ai_recs
+                st.session_state.center_node = selected
+                st.session_state.view_source = "AI (Audio)"
+                st.rerun()
+            else: st.error("Not enough data for AI analysis. (Need 5+ bands)")
+
+    try:
+        row = df_db[df_db['Artist'] == selected]
+        
+        if row.empty:
+            d_live = get_deezer_data(selected)
+            r = {
+                'Image URL': d_live['image'] if d_live else '',
+                'Audio_BPM': 0, 'Audio_Brightness': 0.5, 'Tag_Energy': 0.5, 'Valence': 0.5,
+                'Monthly Listeners': d_live['listeners'] if d_live else 0, 'Genre': 'Unknown'
+            }
+        else:
+            r = row.iloc[0]
+
+        col1, col2 = st.columns([1, 2])
+        
+        with col1:
+            img = r.get('Image URL')
+            if img and str(img).startswith("http"): st.image(img)
+            
+            d_live = get_deezer_data(selected)
+            if d_live and d_live.get('id'):
+                preview = get_deezer_preview(d_live['id'])
+                if preview: 
+                    st.audio(preview['preview'], format='audio/mp3')
+                    st.caption(f"🎵 {preview['title']}")
+            
+            audio_b = float(r.get('Audio_Brightness', 0))
+            tag_e = float(r.get('Tag_Energy', 0.5))
+            energy = audio_b if audio_b > 0 else tag_e
+            v_val = float(r.get('Valence', 0.5))
+            
+            st.metric("Fans", f"{int(r['Monthly Listeners']):,}")
+            st.metric("BPM", int(r.get('Audio_BPM', 0)))
+            
+            st.caption(f"🔥 Energy (Intensity): {energy:.2f}")
+            st.progress(energy)
+            st.caption(f"😊 Mood (Happiness): {v_val:.2f}")
+            st.progress(v_val)
+
+        with col2:
+            key = st.secrets["lastfm_key"]
+            with st.spinner("Fetching biography and track list..."):
+                det = get_artist_details(selected, key)
+                tracks = get_top_tracks(selected, key)
+            
+            if det and 'bio' in det: 
+                st.info(det['bio']['summary'].split("<a href")[0])
+            
+            if tracks:
+                t_data = [{"Song": t['name'], "Plays": f"{int(t['playcount']):,}", "Link": t.get('url', '#')} for t in tracks]
+                st.dataframe(pd.DataFrame(t_data), column_config={"Link": st.column_config.LinkColumn("Listen")}, hide_index=True)
+
+    except Exception as e:
+        st.error(f"Dashboard Load Error: {e}")
+
+else:
+    if df_db.empty:
+        st.info("The database is empty! Run bulk_harvester.py to seed data.")
