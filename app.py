@@ -69,15 +69,29 @@ if 'initial_run_complete' not in st.session_state:
 # Check 2: If the session has no data AND the initial run hasn't finished, run the setup.
 if 'view_df' not in st.session_state and not st.session_state.initial_run_complete:
     if not df_db.empty:
-        # Initial Random Cluster View
-        sample_size = min(len(df_db), 30)
-        sample_df = df_db.sample(n=sample_size)
+        # FIX: Force the full discovery sequence to run on a random artist
         
-        st.session_state.view_df = sample_df
-        st.session_state.center_node = sample_df.sort_values('Monthly Listeners', ascending=False).iloc[0]['Artist']
-        st.session_state.view_source = "Random Cluster"
-    else:
-        st.session_state.view_df = pd.DataFrame()
+        # 1. Select a random artist to be the anchor
+        sample_df = df_db.sample(min(len(df_db), 30))
+        random_center = sample_df.sort_values('Monthly Listeners', ascending=False).iloc[0]['Artist']
+        
+        # 2. RUN DISCOVERY: This executes the network call and sets the session state correctly
+        try:
+            key = st.secrets["lastfm_key"]
+            # Clear cache just before the crucial initial discovery run
+            st.cache_data.clear() 
+            if run_discovery(random_center, "Artist", key, df_db):
+                 st.session_state.initial_run_complete = True
+                 st.rerun()
+            else:
+                 # Fallback if discovery fails (e.g., API is down)
+                 st.session_state.initial_run_complete = True # Prevent infinite loop
+                 st.error("Initial load failed to find neighbors for anchor artist. Try searching.")
+
+        except Exception as e:
+             st.error(f"Initial Load Discovery Failed: {e}")
+             st.session_state.view_df = pd.DataFrame()
+
 
 # --- 3. SIDEBAR (CONTROLS) ---
 with st.sidebar:
@@ -139,7 +153,7 @@ if not disp_df.empty:
 
 # FIX: Auto-select the center node for the dashboard immediately after search/load
 if selected:
-    pass # selected has been set by agraph click
+    pass 
 elif center and center != 'Unknown':
     selected = center # Fallback: use the center node as the default selected item
 
@@ -168,9 +182,7 @@ if selected:
         # Load detailed row data from DB
         row = df_db[df_db['Artist'] == selected]
         
-        # Handle case where selected node is in graph but not in current DB snapshot
         if row.empty:
-            # Fallback: Fetch live minimal data
             d_live = get_deezer_data(selected)
             r = {
                 'Image URL': d_live['image'] if d_live else '',
@@ -196,7 +208,6 @@ if selected:
                     st.caption(f"🎵 {preview['title']}")
             
             # Vibe Meters
-            # Prioritize Audio Brightness if available
             audio_b = float(r.get('Audio_Brightness', 0))
             tag_e = float(r.get('Tag_Energy', 0.5))
             energy = audio_b if audio_b > 0 else tag_e
