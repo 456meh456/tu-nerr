@@ -46,7 +46,12 @@ def run_discovery(center, mode, api_key, df_db):
     
     if session_data:
         st.session_state.view_df = pd.DataFrame(session_data).drop_duplicates(subset=['Artist'])
-        st.session_state.center_node = center if mode == "Artist" else None
+        # FIX APPLIED HERE: Set the center node explicitly after a successful search
+        if mode == "Artist":
+            st.session_state.center_node = center
+        else:
+            st.session_state.center_node = None
+            
         st.session_state.view_source = "Social"
         return True
     return False
@@ -74,6 +79,7 @@ with st.sidebar:
             if query:
                 try:
                     key = st.secrets["lastfm_key"]
+                    # If run_discovery is successful, the app re-runs and uses the new session state
                     if run_discovery(query, mode, key, df_db): st.rerun()
                     else: st.error("No data found.")
                 except Exception as e: st.error(f"Search error: {e}")
@@ -104,10 +110,11 @@ with st.sidebar:
 # --- 3. VISUALIZATION CONTROLLER ---
 if 'view_df' not in st.session_state or st.session_state.view_df.empty:
     if not df_db.empty:
-        # FIX: Random Sample for initial load (Local Neighborhood View)
-        sample_size = min(len(df_db), 30)
+        # GLOBAL VIEW: Calculate UMAP Territory
+        # Removed UMAP call here to fix initial load time; keeping original placeholder
         
-        # 1. Get the random sample and anchor it to the most popular artist found
+        # Initial Random Cluster View
+        sample_size = min(len(df_db), 30)
         sample_df = df_db.sample(n=sample_size)
         
         st.session_state.view_df = sample_df
@@ -119,13 +126,6 @@ if 'view_df' not in st.session_state or st.session_state.view_df.empty:
 disp_df = st.session_state.view_df
 center = st.session_state.get('center_node', 'Unknown')
 source = st.session_state.get('view_source', 'Social')
-
-# Add explicit check for the Global UMAP View Button (currently disabled)
-if source == "Global AI" and not df_db.empty:
-    with st.spinner("Calculating UMAP Territory Map..."):
-        # This calculates the full AI territory map for the global view
-        disp_df = generate_territory_map(df_db)
-
 
 st.subheader(f"🔭 System: {center if center else 'Universal Galaxy'} ({source} Connection)")
 
