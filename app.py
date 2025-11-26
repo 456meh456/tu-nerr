@@ -32,17 +32,24 @@ def run_discovery(center, mode, api_key, df_db):
     session_data = []
     prog = st.progress(0)
     
-    # Create a set of existing lowercase names to prevent re-processing known bands during this session
-    session_added_set = set(df_db['Artist_Lower'].tolist()) if not df_db.empty else set()
+    # FIX: Initialize a set to track which artists have been processed *in this run* # to prevent duplicates if they appear multiple times in the targets list.
+    session_data_names = set() 
         
     for i, artist in enumerate(targets):
         prog.progress((i + 1) / len(targets))
         
-        # Process: Checks DB -> Fetches API -> Analyzes Audio -> Saves to SQL
-        # process_artist in api_handler now handles the SQL inserts via db_model
-        data = process_artist(artist, df_db, api_key, session_added_set)
+        # 1. Check if we already added it to the session data
+        if artist.strip().lower() in session_data_names:
+            continue
+            
+        # 2. Process: Checks DB -> Fetches API -> Analyzes Audio -> Saves to SQL
+        # We pass the *full* df_db to process_artist so it can look up existing data.
+        data = process_artist(artist, df_db, api_key, session_data_names)
+        
         if data: 
             session_data.append(data)
+            # Add the cleaned name to the session data set
+            session_data_names.add(data['Artist'].lower())
     
     if session_data:
         st.session_state.view_df = pd.DataFrame(session_data).drop_duplicates(subset=['Artist'])
@@ -79,7 +86,6 @@ with st.sidebar:
             if query:
                 try:
                     key = st.secrets["lastfm_key"]
-                    # If run_discovery is successful, the app re-runs and uses the new session state
                     if run_discovery(query, mode, key, df_db): st.rerun()
                     else: st.error("No data found.")
                 except Exception as e: st.error(f"Search error: {e}")
@@ -110,9 +116,6 @@ with st.sidebar:
 # --- 3. VISUALIZATION CONTROLLER ---
 if 'view_df' not in st.session_state or st.session_state.view_df.empty:
     if not df_db.empty:
-        # GLOBAL VIEW: Calculate UMAP Territory
-        # Removed UMAP call here to fix initial load time; keeping original placeholder
-        
         # Initial Random Cluster View
         sample_size = min(len(df_db), 30)
         sample_df = df_db.sample(n=sample_size)
