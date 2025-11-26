@@ -7,13 +7,13 @@ import tempfile
 import numpy as np
 import librosa
 import json
-from src.db_model import add_artist, add_track, synthesize_scores
+from src.db_model import add_artist, add_track, synthesize_scores, fetch_all_artists_df
 
 # Disable SSL warnings for API calls
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- API HELPERS ---
-# (Helper functions unchanged, omitted for space)
+
 def get_similar_artists(artist_name, api_key, limit=10):
     url = f"http://ws.audioscrobbler.com/2.0/?method=artist.getsimilar&artist={artist_name}&api_key={api_key}&limit={limit}&format=json"
     try:
@@ -58,6 +58,50 @@ def get_deezer_preview(artist_id):
     except: pass
     return None
 
+def get_release_year(artist_id):
+    """
+    FIX: Fetches the full discography and finds the absolute earliest release year
+    by iterating through the album list and finding the minimum date.
+    """
+    earliest_date_str = None
+    offset = 0
+    limit = 50 # Max items per page
+    
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    
+    while True:
+        try:
+            url = f"https://api.deezer.com/artist/{artist_id}/albums?limit={limit}&index={offset}"
+            resp = requests.get(url, headers=headers, verify=False, timeout=5).json()
+            
+            if 'data' not in resp or not resp['data']:
+                break
+                
+            dates = [album.get('release_date') for album in resp['data'] if album.get('release_date')]
+            
+            if dates:
+                current_min_date = min(dates)
+                if earliest_date_str is None or current_min_date < earliest_date_str:
+                    earliest_date_str = current_min_date
+
+            # If total count is less than the current index + limit, we are done
+            if resp.get('total') is not None and resp['total'] <= offset + limit:
+                break
+                
+            # If there is a 'next' link, continue to the next page
+            if 'next' in resp:
+                offset += limit
+            else:
+                break
+            
+        except Exception:
+            break # Stop on any network error
+
+    if earliest_date_str:
+        return int(earliest_date_str[:4])
+    
+    return 0
+
 
 # --- AUDIO ANALYSIS & DATA PROCESSING ---
 
@@ -76,10 +120,11 @@ def analyze_audio(preview_url):
             tmp.write(response.content)
             tmp_path = tmp.name
         
+        # Load Audio and extract features
         y, sr = librosa.load(tmp_path, duration=30, sr=22050, mono=True)
         
         onset_env = librosa.onset.onset_strength(y=y, sr=sr)
-        tempo = librosa.beat.tempo(onset_envelope=onset_env, sr=sr)
+        tempo = librosa.beat.tempo(onset_env, sr=sr)
         bpm = round(float(tempo[0])) if isinstance(tempo, np.ndarray) else round(float(tempo))
             
         spectral_centroids = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
@@ -103,34 +148,34 @@ def analyze_audio(preview_url):
             "warmth": norm_warmth,
             "complexity": norm_complexity
         }
-    except: return None 
+    except Exception as e: 
+        print(f"Librosa Analysis Failed: {e}")
+        return None 
     finally:
         if 'tmp_path' in locals() and os.path.exists(tmp_path):
             try: os.remove(tmp_path)
             except: pass
 
 def get_deezer_data(artist_name):
-    """Fetches Deezer ID, Listener count, and Image/Preview URL, plus Top Track Title."""
+    """Fetches Deezer ID, Listener count, Image, and Preview URL for processing."""
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     try:
-        # 1. Search Artist
         url = f"https://api.deezer.com/search/artist?q={artist_name}"
         response = requests.get(url, headers=headers, verify=False, timeout=5)
         if response.status_code != 200 or not response.json().get('data'): return None
         artist = response.json()['data'][0]
         
-        # 2. Get Top Track Preview/Title (CRITICAL FOR LIVE INSERTS)
+        # We need the top track ID for analysis and year lookup
         track_url = f"https://api.deezer.com/artist/{artist['id']}/top?limit=1"
-        t_resp = requests.get(track_url, headers=headers, verify=False, timeout=5).json()
-        
-        top_track_title = t_resp['data'][0]['title'] if t_resp.get('data') and t_resp['data'] else "Top Track"
-        preview = t_resp['data'][0]['preview'] if t_resp.get('data') and t_resp['data'] else None
+        t_data = requests.get(track_url, headers=headers, verify=False, timeout=5).json()
+        preview = t_data['data'][0]['preview'] if t_data.get('data') else None
+        top_track_id = t_data['data'][0]['id'] if t_data.get('data') else None
+
 
         return {
             "name": artist['name'], "id": artist['id'], "listeners": artist['nb_fan'],
-            "image": artist['picture_medium'], "link": artist['link'],
-            "top_track_title": top_track_title, # NEW: The actual song name
-            "preview": preview # Preview URL
+            "image": artist['picture_medium'], "link": artist['link'], "preview": preview,
+            "top_track_id": top_track_id # Export the ID needed for year lookup
         }
     except: return None
 
@@ -157,8 +202,8 @@ def process_artist(name, df_db, api_key, session_added_set):
 
     # 3. Calculate Scores
     tags = [t['name'].lower() for t in lastfm_info['tags']['tag']]
-    VALENCE_SCORES = {'happy': 0.9, 'party': 0.9, 'pop': 0.8, 'sad': 0.2, 'dark': 0.15, 'doom': 0.1, 'metal': 0.3}
-    ENERGY_SCORES = {'death': 1.0, 'metal': 0.9, 'punk': 0.9, 'rock': 0.7, 'pop': 0.6, 'acoustic': 0.2}
+    VALENCE_SCORES = {'happy': 0.9, 'pop': 0.8, 'sad': 0.2, 'metal': 0.3}
+    ENERGY_SCORES = {'death': 1.0, 'metal': 0.9, 'punk': 0.9, 'rock': 0.7, 'pop': 0.6}
     
     def score(d):
         h = [v for k,v in d.items() for t in tags if k in t]
@@ -168,27 +213,34 @@ def process_artist(name, df_db, api_key, session_added_set):
     tag_valence = score(VALENCE_SCORES)
     main_genre = tags[0].title() if tags else "Unknown"
 
-    # 4. INSERT PARENT ARTIST (SQL)
+    # 4. GET RELEASE YEAR (Time Travel)
+    release_year = 0
+    if deezer_info.get('id'):
+        release_year = get_release_year(deezer_info['id'])
+
+
+    # 5. INSERT PARENT ARTIST (SQL)
     artist_data = {
         "Artist": clean_name, "Genre": main_genre,
         "Monthly Listeners": deezer_info['listeners'], "Image URL": deezer_info['image'],
-        "Valence": tag_valence, "Tag_Energy": tag_energy
+        "Valence": tag_valence, "Tag_Energy": tag_energy,
+        "First Release Year": release_year # <-- NOW CORRECTLY FETCHED
     }
     artist_id = add_artist(artist_data)
 
-    # 5. LIVE AUDIO ANALYSIS (1 Track for Speed)
+    # 6. LIVE AUDIO ANALYSIS (1 Track for Speed)
     phys = analyze_audio(deezer_info['preview'])
     if phys:
-        # Save track with the real title
+        # Add Track to SQL
         track_rec = {
-            "title": deezer_info['top_track_title'], 
+            "title": "Top Track (Live Scan)", # Use placeholder title for live search
             "preview": deezer_info['preview'],
             **phys
         }
         add_track(artist_id, track_rec)
-        synthesize_scores(artist_id)
+        synthesize_scores(artist_id) # Update averages
 
-    # 6. Return Data for UI (Construct manually for immediate display)
+    # 7. Return Data for UI 
     final_data = artist_data.copy()
     final_data['Audio_BPM'] = phys['bpm'] if phys else 0
     final_data['Audio_Brightness'] = phys['brightness'] if phys else 0

@@ -6,9 +6,7 @@ import tempfile
 import numpy as np
 import librosa
 import pandas as pd
-import random # Needed for sampling
-
-# Import the SQL Database Manager
+import random
 from src.db_model import add_artist, add_track, synthesize_scores, fetch_all_artists_df
 
 # --- CONFIGURATION ---
@@ -24,7 +22,7 @@ SEED_ARTISTS = ["Metallica", "The Beatles", "Gorillaz", "Chris Stapleton", "Doll
 # Disable SSL warnings for the requests library
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# We need to load secrets just for the Last.fm API Key
+# Load Secrets for API Keys
 import toml
 SECRETS_PATH = ".streamlit/secrets.toml"
 try:
@@ -53,46 +51,35 @@ def analyze_audio(preview_url):
             tmp_path = tmp.name
         
         # 3. Load Audio
-        # sr=22050 is standard for analysis, mono=True mixes to single channel
         y, sr = librosa.load(tmp_path, duration=30, sr=22050, mono=True)
         
         # 4. Extract Physics
-        # BPM
         onset_env = librosa.onset.onset_strength(y=y, sr=sr)
         tempo = librosa.beat.tempo(onset_envelope=onset_env, sr=sr)
         bpm = round(float(tempo[0])) if isinstance(tempo, np.ndarray) else round(float(tempo))
             
-        # Brightness (Spectral Centroid)
         spectral_centroids = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
         brightness = np.mean(spectral_centroids)
         norm_brightness = min(brightness / 3000, 1.0)
 
-        # Noisiness (Zero Crossing Rate) - Filters Rap/Percussive Cadence
         zcr = np.mean(librosa.feature.zero_crossing_rate(y))
         norm_noise = min(zcr * 10, 1.0) 
 
-        # Warmth (Spectral Rolloff)
         rolloff = np.mean(librosa.feature.spectral_rolloff(y=y, sr=sr, roll_percent=0.85)[0])
         norm_warmth = min(rolloff / 5000, 1.0)
 
-        # Complexity (Chroma Variance)
         chroma = librosa.feature.chroma_stft(y=y, sr=sr)
         complexity = np.mean(np.std(chroma, axis=1))
         norm_complexity = min(complexity * 5, 1.0)
         
         return {
-            "bpm": bpm,
-            "brightness": norm_brightness,
-            "noisiness": norm_noise,
-            "warmth": norm_warmth,
-            "complexity": norm_complexity
+            "bpm": bpm, "brightness": norm_brightness, "noisiness": norm_noise, 
+            "warmth": norm_warmth, "complexity": norm_complexity
         }
 
-    except Exception as e:
-        # print(f"Audio Error: {e}")
-        return None
+    except Exception: return None
     finally:
-        if tmp_path and os.path.exists(tmp_path):
+        if 'tmp_path' in locals() and os.path.exists(tmp_path):
             try: os.remove(tmp_path)
             except: pass
 
@@ -101,25 +88,50 @@ def get_neighbors(artist, limit=50, page=1):
     url = f"http://ws.audioscrobbler.com/2.0/?method=artist.getsimilar&artist={artist}&api_key={API_KEY}&limit={limit}&page={page}&format=json"
     try:
         resp = requests.get(url, verify=False, timeout=5).json()
-        if 'similarartists' not in resp: return []
-        return [a['name'] for a in resp['similarartists']['artist']]
+        return [a['name'] for a in resp['similarartists']['artist']] if 'similarartists' in resp else []
     except: return []
 
-def get_deezer_data(artist_name):
-    """Fetches Artist ID, Fans, Image."""
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+def get_release_year(artist_id):
+    """
+    FIX: Fetches the full discography and finds the absolute earliest release year
+    by iterating through the album list and finding the minimum date.
+    """
     try:
-        url = f"https://api.deezer.com/search/artist?q={artist_name}"
+        url = f"https://api.deezer.com/artist/{artist_id}/albums?limit=50"
+        headers = {'User-Agent': 'Mozilla/5.0'}
         resp = requests.get(url, headers=headers, verify=False, timeout=5).json()
         
-        if not resp.get('data'): return None
-        artist = resp['data'][0]
+        if 'data' in resp:
+            # Extract all valid release dates and sort them
+            dates = [album.get('release_date') for album in resp['data'] if album.get('release_date')]
+            
+            if not dates: return 0
+                 
+            # Find the minimum date string (earliest) and extract the year
+            earliest_date = min(dates)
+            return int(earliest_date[:4])
+
+    except:
+        return 0
+
+def get_deezer_data(artist_name):
+    """Fetches Deezer ID, Listeners, Image, and Preview URL."""
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+    try:
+        # 1. Search Artist
+        url = f"https://api.deezer.com/search/artist?q={artist_name}"
+        response = requests.get(url, headers=headers, verify=False, timeout=5)
+        if response.status_code != 200 or not response.json().get('data'): return None
+        artist = response.json()['data'][0]
         
+        # 2. Get Top Track Preview URL
+        track_url = f"https://api.deezer.com/artist/{artist['id']}/top?limit=1"
+        t_data = requests.get(track_url, headers=headers, verify=False, timeout=5).json()
+        preview = t_data['data'][0]['preview'] if t_data.get('data') else None
+
         return {
-            "name": artist['name'], 
-            "id": artist['id'], 
-            "listeners": artist['nb_fan'], 
-            "image": artist['picture_medium']
+            "name": artist['name'], "id": artist['id'], "listeners": artist['nb_fan'],
+            "image": artist['picture_medium'], "link": artist['link'], "preview": preview,
         }
     except: return None
 
@@ -134,10 +146,7 @@ def get_top_tracks_previews(deezer_id):
         if resp.get('data'):
             for t in resp['data']:
                 if 'preview' in t and t['preview']:
-                    tracks.append({
-                        "title": t['title'],
-                        "preview": t['preview']
-                    })
+                    tracks.append({"title": t['title'], "preview": t['preview']})
         return tracks
     except: return []
 
@@ -170,8 +179,11 @@ def process_artist_sql(name):
     tags, tag_energy, valence = get_lastfm_tags(clean_name)
     main_genre = tags[0].title() if tags else "Unknown"
 
-    print(f"   ✨ Found: {clean_name}")
-
+    # CRITICAL FIX: Get the Release Year based on the Artist ID
+    release_year = 0
+    if d_info.get('id'):
+        release_year = get_release_year(d_info['id'])
+    
     # 2. Create Artist in SQL (Parent Record)
     artist_data = {
         "Artist": clean_name,
@@ -180,10 +192,10 @@ def process_artist_sql(name):
         "Image URL": d_info['image'],
         "Valence": valence,
         "Tag_Energy": tag_energy,
-        "First Release Year": 0 # Placeholder until we add discography logic
+        "First Release Year": release_year # <-- NOW CORRECTLY FETCHED
     }
     
-    # This inserts the artist and gets the Primary Key ID
+    # This inserts the artist and gets the Primary Key ID (Upsert logic in db_model)
     artist_id = add_artist(artist_data)
     
     # 3. Process Tracks (Child Records)
@@ -195,12 +207,8 @@ def process_artist_sql(name):
     for t in tracks:
         audio_features = analyze_audio(t['preview'])
         if audio_features:
-            # Merge title/url with physics data
-            track_record = {**t, **audio_features}
-            
-            # Insert Track into SQL
+            track_record = {**t, **audio_features, "title": t['title']}
             add_track(artist_id, track_record)
-            
             analyzed_count += 1
             print(f"         - {t['title']} (BPM: {audio_features['bpm']})")
             time.sleep(0.5)
@@ -228,8 +236,7 @@ def run_bulk_harvest():
         source_artists = SEED_ARTISTS
         existing_artists = set()
     else:
-        # SAMPLING LOGIC: Grab a random subset of existing artists to be the "seed" for this run
-        # This prevents the script from trying to iterate through 5,000 bands every time.
+        # SAMPLING LOGIC
         full_list = df['Artist'].tolist()
         if len(full_list) > MAX_SEEDS_PER_RUN:
             print(f"🎲 Database large. Sampling {MAX_SEEDS_PER_RUN} random artists to expand frontier.")
