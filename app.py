@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import time
+import random 
 
 # --- IMPORT MODULES ---
 from src.db_model import fetch_all_artists_df, delete_artist
@@ -69,28 +70,39 @@ if 'initial_run_complete' not in st.session_state:
 # Check 2: If the session has no data AND the initial run hasn't finished, run the setup.
 if 'view_df' not in st.session_state and not st.session_state.initial_run_complete:
     if not df_db.empty:
-        # FIX: Force the full discovery sequence to run on a random artist
+        # --- FIX IMPLEMENTATION: RETRY LOGIC ---
+        MAX_RETRIES = 3
         
-        # 1. Select a random artist to be the anchor
-        sample_df = df_db.sample(min(len(df_db), 30))
-        random_center = sample_df.sort_values('Monthly Listeners', ascending=False).iloc[0]['Artist']
-        
-        # 2. RUN DISCOVERY: This executes the network call and sets the session state correctly
-        try:
-            key = st.secrets["lastfm_key"]
-            # Clear cache just before the crucial initial discovery run
-            st.cache_data.clear() 
-            if run_discovery(random_center, "Artist", key, df_db):
-                 st.session_state.initial_run_complete = True
-                 st.rerun()
-            else:
-                 # Fallback if discovery fails (e.g., API is down)
-                 st.session_state.initial_run_complete = True # Prevent infinite loop
-                 st.error("Initial load failed to find neighbors for anchor artist. Try searching.")
+        for attempt in range(MAX_RETRIES):
+            # Select a random artist to be the anchor
+            sample_df = df_db.sample(min(len(df_db), 30))
+            random_center = sample_df.sort_values('Monthly Listeners', ascending=False).iloc[0]['Artist']
+            
+            try:
+                key = st.secrets["lastfm_key"]
+                st.cache_data.clear() 
+                
+                # Run the discovery sequence (network intensive part)
+                if run_discovery(random_center, "Artist", key, df_db):
+                     # Success: Set state flag and force refresh to render clean map
+                     st.session_state.initial_run_complete = True
+                     st.rerun() 
+                     break # Exit the retry loop on success
+                else:
+                    # Log failure to find neighbors for this anchor artist
+                    print(f"Initial Load Attempt {attempt + 1}: Neighbors not found for {random_center}.")
+                    time.sleep(0.5)
 
-        except Exception as e:
-             st.error(f"Initial Load Discovery Failed: {e}")
-             st.session_state.view_df = pd.DataFrame()
+            except Exception as e:
+                 # Log fatal crash (usually networking) and retry
+                 print(f"Initial Load Attempt {attempt + 1}: CRASHED ({e}). Retrying...")
+                 time.sleep(1)
+        
+        # FINAL FALLBACK if all retries fail
+        if not st.session_state.initial_run_complete:
+            st.session_state.view_df = pd.DataFrame()
+            st.error("Initial load failed after 3 attempts. Please try manual search.")
+        
 
 
 # --- 3. SIDEBAR (CONTROLS) ---
@@ -116,6 +128,8 @@ with st.sidebar:
     
     st.divider()
     if st.button("🔄 Reset Map"):
+        # Reset flag to allow the initial load logic to run again
+        st.session_state.initial_run_complete = False 
         if 'view_df' in st.session_state: del st.session_state['view_df']
         if 'center_node' in st.session_state: del st.session_state['center_node']
         st.rerun()
@@ -151,7 +165,7 @@ if not disp_df.empty:
 
 # --- 5. DASHBOARD ---
 
-# FIX: Auto-select the center node for the dashboard immediately after search/load
+# Auto-select the center node for the dashboard immediately after search/load
 if selected:
     pass 
 elif center and center != 'Unknown':
@@ -182,7 +196,9 @@ if selected:
         # Load detailed row data from DB
         row = df_db[df_db['Artist'] == selected]
         
+        # Handle case where selected node is in graph but not in current DB snapshot
         if row.empty:
+            # Fallback: Fetch live minimal data
             d_live = get_deezer_data(selected)
             r = {
                 'Image URL': d_live['image'] if d_live else '',
@@ -208,6 +224,7 @@ if selected:
                     st.caption(f"🎵 {preview['title']}")
             
             # Vibe Meters
+            # Prioritize Audio Brightness if available
             audio_b = float(r.get('Audio_Brightness', 0))
             tag_e = float(r.get('Tag_Energy', 0.5))
             energy = audio_b if audio_b > 0 else tag_e
