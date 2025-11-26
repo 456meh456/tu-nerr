@@ -3,7 +3,6 @@ import pandas as pd
 import time
 
 # --- IMPORT MODULES ---
-# We now import from db_model (Supabase/SQL)
 from src.db_model import fetch_all_artists_df, delete_artist
 from src.api_handler import get_similar_artists, get_top_artists_by_genre, process_artist, get_artist_details, get_top_tracks, get_deezer_data, get_deezer_preview
 from src.ai_engine import get_ai_neighbors, generate_territory_map
@@ -39,6 +38,7 @@ def run_discovery(center, mode, api_key, df_db):
         prog.progress((i + 1) / len(targets))
         
         # Process: Checks DB -> Fetches API -> Analyzes Audio -> Saves to SQL
+        # process_artist in api_handler now handles the SQL inserts via db_model
         data = process_artist(artist, df_db, api_key, session_added_set)
         if data: 
             session_data.append(data)
@@ -64,7 +64,29 @@ except Exception as e:
     st.error(f"FATAL DB ERROR: Failed to load initial data. Details: {e}")
     st.stop()
 
-# --- 2. SIDEBAR (CONTROLS) ---
+# --- 2. INITIAL VIEW STATE CHECK ---
+if 'view_df' not in st.session_state or st.session_state.view_df.empty:
+    if not df_db.empty:
+        # FIX: Random Entry Point - Trigger a discovery run if the map is empty
+        
+        # 1. Select a random artist to be the anchor
+        sample_df = df_db.sample(min(len(df_db), 30))
+        random_center = sample_df.sort_values('Monthly Listeners', ascending=False).iloc[0]['Artist']
+        
+        # 2. RUN DISCOVERY: Force the network to fetch neighbors for the random anchor
+        # This creates the edges needed for the graph to display correctly
+        try:
+            key = st.secrets["lastfm_key"]
+            run_discovery(random_center, "Artist", key, df_db)
+            st.rerun() # Rerun to display the newly set session state
+        except Exception as e:
+             st.error(f"Initial Load Discovery Failed: {e}")
+             st.session_state.view_df = pd.DataFrame() # Fallback
+
+    else:
+        st.session_state.view_df = pd.DataFrame()
+
+# --- 3. SIDEBAR (CONTROLS) ---
 with st.sidebar:
     st.header("🚀 Discovery Engine")
     
@@ -84,7 +106,7 @@ with st.sidebar:
                 except Exception as e: st.error(f"Search error: {e}")
     
     st.divider()
-    if st.button("🔄 Reset / Global Map"):
+    if st.button("🔄 Reset Map"):
         if 'view_df' in st.session_state: del st.session_state['view_df']
         if 'center_node' in st.session_state: del st.session_state['center_node']
         st.rerun()
@@ -106,21 +128,7 @@ with st.sidebar:
                 else:
                     st.error("Delete failed.")
 
-# --- 3. VISUALIZATION CONTROLLER ---
-if 'view_df' not in st.session_state or st.session_state.view_df.empty:
-    if not df_db.empty:
-        # GLOBAL VIEW FIX: Use a random cluster anchor to prevent the 'Hairball' crash
-        
-        # Initial Random Cluster View
-        sample_size = min(len(df_db), 30)
-        sample_df = df_db.sample(n=sample_size)
-        
-        st.session_state.view_df = sample_df
-        st.session_state.center_node = sample_df.sort_values('Monthly Listeners', ascending=False).iloc[0]['Artist']
-        st.session_state.view_source = "Random Cluster"
-    else:
-        st.session_state.view_df = pd.DataFrame()
-
+# --- 4. VISUALIZATION CONTROLLER ---
 disp_df = st.session_state.view_df
 center = st.session_state.get('center_node', 'Unknown')
 source = st.session_state.get('view_source', 'Social')
@@ -132,7 +140,7 @@ if not disp_df.empty:
     # Render the graph via the visuals module
     selected = render_graph(disp_df, center, source)
 
-# --- 4. DASHBOARD (Delegated from Visuals) ---
+# --- 5. DASHBOARD ---
 if selected:
     st.divider()
     c1, c2 = st.columns([3, 1])
