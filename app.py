@@ -67,22 +67,15 @@ except Exception as e:
 # --- 2. INITIAL VIEW STATE CHECK ---
 if 'view_df' not in st.session_state or st.session_state.view_df.empty:
     if not df_db.empty:
-        # FIX: Random Entry Point - Trigger a discovery run if the map is empty
+        # FIX: Random Sample for initial load (Local Neighborhood View)
+        # We STOP calling run_discovery() here, and just sample the existing DB.
         
-        # 1. Select a random artist to be the anchor
-        sample_df = df_db.sample(min(len(df_db), 30))
-        random_center = sample_df.sort_values('Monthly Listeners', ascending=False).iloc[0]['Artist']
+        sample_size = min(len(df_db), 30)
+        sample_df = df_db.sample(n=sample_size)
         
-        # 2. RUN DISCOVERY: Force the network to fetch neighbors for the random anchor
-        # This creates the edges needed for the graph to display correctly
-        try:
-            key = st.secrets["lastfm_key"]
-            run_discovery(random_center, "Artist", key, df_db)
-            st.rerun() # Rerun to display the newly set session state
-        except Exception as e:
-             st.error(f"Initial Load Discovery Failed: {e}")
-             st.session_state.view_df = pd.DataFrame() # Fallback
-
+        st.session_state.view_df = sample_df
+        st.session_state.center_node = sample_df.sort_values('Monthly Listeners', ascending=False).iloc[0]['Artist']
+        st.session_state.view_source = "Random Cluster"
     else:
         st.session_state.view_df = pd.DataFrame()
 
