@@ -1,9 +1,12 @@
 import streamlit as st
 import pandas as pd
 import time
+import os
+import tempfile
+import numpy as np
+import librosa
 
 # --- IMPORT MODULES ---
-# We now import from db_model (Supabase/SQL)
 from src.db_model import fetch_all_artists_df, delete_artist
 from src.api_handler import get_similar_artists, get_top_artists_by_genre, process_artist, get_artist_details, get_top_tracks, get_deezer_data, get_deezer_preview
 from src.ai_engine import get_ai_neighbors, generate_territory_map
@@ -32,10 +35,8 @@ def run_discovery(center, mode, api_key, df_db):
     session_data = []
     prog = st.progress(0)
     
-    # FIX: Initialize as empty set so we retrieve existing bands from DB for display
-    # instead of skipping them. Deduplication happens in process_artist (DB check)
-    # and at the end of this function (DataFrame drop_duplicates).
-    session_added_set = set()
+    # Create a set of existing lowercase names to prevent re-processing known bands during this session
+    session_added_set = set(df_db['Artist_Lower'].tolist()) if not df_db.empty else set()
         
     for i, artist in enumerate(targets):
         prog.progress((i + 1) / len(targets))
@@ -45,9 +46,6 @@ def run_discovery(center, mode, api_key, df_db):
         data = process_artist(artist, df_db, api_key, session_added_set)
         if data: 
             session_data.append(data)
-            # Mark as processed in this specific run loop to avoid re-processing 
-            # if duplicates exist within the targets list itself
-            session_added_set.add(artist.strip().lower())
     
     if session_data:
         st.session_state.view_df = pd.DataFrame(session_data).drop_duplicates(subset=['Artist'])
@@ -59,7 +57,6 @@ def run_discovery(center, mode, api_key, df_db):
 # --- 1. INITIAL LOAD (FROM SUPABASE) ---
 try:
     # Load data from Supabase (SQL)
-    # This function maps the SQL columns (avg_bpm) to App columns (Audio_BPM)
     df_db = fetch_all_artists_df()
 except Exception as e:
     st.error(f"FATAL DB ERROR: Failed to load initial data. Details: {e}")
@@ -112,7 +109,7 @@ if 'view_df' not in st.session_state or st.session_state.view_df.empty:
     if not df_db.empty:
         # GLOBAL VIEW: Calculate UMAP Territory
         with st.spinner("Calculating AI Territory Map..."):
-            # This adds 'UMAP_X' and 'UMAP_Y' columns to the dataframe
+            # Call the UMAP function here
             st.session_state.view_df = generate_territory_map(df_db)
         
         st.session_state.center_node = None
@@ -211,7 +208,7 @@ if selected:
             
             if tracks:
                 t_data = [{"Song": t['name'], "Plays": f"{int(t['playcount']):,}", "Link": t['url']} for t in tracks]
-                st.dataframe(pd.DataFrame(t_data), column_config={"Link": st.column_config.LinkColumn("Link")}, hide_index=True)
+                st.dataframe(pd.DataFrame(t_data), column_config={"Link": st.column_config.LinkColumn("Listen")}, hide_index=True)
 
     except Exception as e:
         st.error(f"Dashboard Load Error: {e}")
