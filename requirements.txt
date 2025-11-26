@@ -1,8 +1,7 @@
 streamlit
 pandas
 requests
-gspread
-google-auth
+supabase
 streamlit-agraph
 toml
 urllib3
