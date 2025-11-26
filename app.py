@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
 import time
-import random 
 
 # --- IMPORT MODULES ---
 from src.db_model import fetch_all_artists_df, delete_artist
@@ -20,57 +19,40 @@ def run_discovery(center, mode, api_key, df_db):
     targets = []
     with st.spinner(f"Scanning: {center}..."):
         if mode == "Artist":
-            targets.append(center)
+            targets.append(center) # The center node itself
             similar = get_similar_artists(center, api_key, limit=20) 
             targets.extend(similar)
         else:
             targets = get_top_artists_by_genre(center, api_key, limit=20)
     
-    targets = list(set(targets))
+    targets = list(set(targets)) # Deduplicate initial targets
 
     session_data = []
     prog = st.progress(0)
     
-    # Initialize set to track processed artists during this run
-    session_data_names = set() 
+    # Create a set of existing lowercase names to prevent re-processing known bands during this session
+    session_added_set = set(df_db['Artist_Lower'].tolist()) if not df_db.empty else set()
         
     for i, artist in enumerate(targets):
         prog.progress((i + 1) / len(targets))
         
-        if artist.strip().lower() in session_data_names: continue
-            
         # Process: Checks DB -> Fetches API -> Analyzes Audio -> Saves to SQL
-        data = process_artist(artist, df_db, api_key, session_data_names)
-        
+        data = process_artist(artist, df_db, api_key, session_added_set)
         if data: 
             session_data.append(data)
-            session_data_names.add(data['Artist'].lower())
     
     if session_data:
         st.session_state.view_df = pd.DataFrame(session_data).drop_duplicates(subset=['Artist'])
-        st.session_state.center_node = center if mode == "Artist" else None
+        
+        # Set the center node explicitly after a successful search
+        if mode == "Artist":
+            st.session_state.center_node = center
+        else:
+            st.session_state.center_node = None # For Genre searches
+            
         st.session_state.view_source = "Social"
         return True
     return False
-
-# --- FIX: ISOLATE INITIAL DISCOVERY RUNNER ---
-def set_initial_view(df_db):
-    """Executes the FIRST discovery run (random cluster) and forces a page refresh."""
-    if not df_db.empty:
-        # 1. Select a random artist to be the anchor
-        sample_df = df_db.sample(min(len(df_db), 30))
-        random_center = sample_df.sort_values('Monthly Listeners', ascending=False).iloc[0]['Artist']
-        
-        # 2. RUN DISCOVERY: Force the network to fetch neighbors for the random anchor
-        try:
-            key = st.secrets["lastfm_key"]
-            # We don't need to check success, we just need to trigger the run
-            run_discovery(random_center, "Artist", key, df_db)
-            st.session_state.initial_run_complete = True
-            st.rerun() # Forces Streamlit to jump to the display stage
-        except Exception as e:
-             st.error(f"Initial Load Discovery Failed: {e}")
-             st.session_state.view_df = pd.DataFrame() # Fallback
 
 # --- 1. INITIAL LOAD ---
 try:
@@ -78,7 +60,6 @@ try:
 except Exception as e:
     st.error(f"FATAL DB ERROR: Failed to load initial data. Details: {e}")
     st.stop()
-
 
 # --- 2. INITIAL VIEW STATE CHECK ---
 # Check 1: Has the app loaded before? (Prevents infinite loop)
@@ -88,11 +69,15 @@ if 'initial_run_complete' not in st.session_state:
 # Check 2: If the session has no data AND the initial run hasn't finished, run the setup.
 if 'view_df' not in st.session_state and not st.session_state.initial_run_complete:
     if not df_db.empty:
-        # Execute the one-time initial discovery
-        set_initial_view(df_db)
+        # Initial Random Cluster View
+        sample_size = min(len(df_db), 30)
+        sample_df = df_db.sample(n=sample_size)
+        
+        st.session_state.view_df = sample_df
+        st.session_state.center_node = sample_df.sort_values('Monthly Listeners', ascending=False).iloc[0]['Artist']
+        st.session_state.view_source = "Random Cluster"
     else:
         st.session_state.view_df = pd.DataFrame()
-
 
 # --- 3. SIDEBAR (CONTROLS) ---
 with st.sidebar:
@@ -151,6 +136,13 @@ if not disp_df.empty:
     selected = render_graph(disp_df, center, source)
 
 # --- 5. DASHBOARD ---
+
+# FIX: Auto-select the center node for the dashboard immediately after search/load
+if selected:
+    pass # selected has been set by agraph click
+elif center and center != 'Unknown':
+    selected = center # Fallback: use the center node as the default selected item
+
 if selected:
     st.divider()
     c1, c2 = st.columns([3, 1])
