@@ -1,12 +1,9 @@
 import streamlit as st
 import pandas as pd
 import time
-import os
-import tempfile
-import numpy as np
-import librosa
 
 # --- IMPORT MODULES ---
+# We now import from db_model (Supabase/SQL)
 from src.db_model import fetch_all_artists_df, delete_artist
 from src.api_handler import get_similar_artists, get_top_artists_by_genre, process_artist, get_artist_details, get_top_tracks, get_deezer_data, get_deezer_preview
 from src.ai_engine import get_ai_neighbors, generate_territory_map
@@ -110,6 +107,7 @@ if 'view_df' not in st.session_state or st.session_state.view_df.empty:
         # GLOBAL VIEW: Calculate UMAP Territory
         with st.spinner("Calculating AI Territory Map..."):
             # Call the UMAP function here
+            # This logic provides the initial state: the global territory map
             st.session_state.view_df = generate_territory_map(df_db)
         
         st.session_state.center_node = None
@@ -207,7 +205,7 @@ if selected:
                 st.info(det['bio']['summary'].split("<a href")[0])
             
             if tracks:
-                t_data = [{"Song": t['name'], "Plays": f"{int(t['playcount']):,}", "Link": t['url']} for t in tracks]
+                t_data = [{"Song": t['name'], "Plays": f"{int(t['playcount']):,}", "Link": t.get('url', '#')}] # Added .get('url', '#') for robustness
                 st.dataframe(pd.DataFrame(t_data), column_config={"Link": st.column_config.LinkColumn("Listen")}, hide_index=True)
 
     except Exception as e:
@@ -215,4 +213,4 @@ if selected:
 
 else:
     if df_db.empty:
-        st.info("The database is empty! Run bulk_harvester.py to seed data.")
+        st.info("The database is empty! Use the sidebar to start your first search.")
