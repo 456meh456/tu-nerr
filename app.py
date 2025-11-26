@@ -32,38 +32,31 @@ def run_discovery(center, mode, api_key, df_db):
     session_data = []
     prog = st.progress(0)
     
-    # FIX: Initialize a set to track which artists have been processed *in this run* # to prevent duplicates if they appear multiple times in the targets list.
-    session_data_names = set() 
+    # Create a set of existing lowercase names to prevent re-processing known bands during this session
+    session_added_set = set(df_db['Artist_Lower'].tolist()) if not df_db.empty else set()
         
     for i, artist in enumerate(targets):
         prog.progress((i + 1) / len(targets))
         
-        # 1. Check if we already added it to the session data
-        if artist.strip().lower() in session_data_names:
-            continue
-            
-        # 2. Process: Checks DB -> Fetches API -> Analyzes Audio -> Saves to SQL
-        # We pass the *full* df_db to process_artist so it can look up existing data.
-        data = process_artist(artist, df_db, api_key, session_data_names)
-        
+        # Process: Checks DB -> Fetches API -> Analyzes Audio -> Saves to SQL
+        data = process_artist(artist, df_db, api_key, session_added_set)
         if data: 
             session_data.append(data)
-            # Add the cleaned name to the session data set
-            session_data_names.add(data['Artist'].lower())
     
     if session_data:
         st.session_state.view_df = pd.DataFrame(session_data).drop_duplicates(subset=['Artist'])
-        # FIX APPLIED HERE: Set the center node explicitly after a successful search
+        
+        # Set the center node explicitly after a successful search
         if mode == "Artist":
             st.session_state.center_node = center
         else:
-            st.session_state.center_node = None
+            st.session_state.center_node = None # For Genre searches
             
         st.session_state.view_source = "Social"
         return True
     return False
 
-# --- 1. INITIAL LOAD (FROM SUPABASE) ---
+# --- 1. INITIAL LOAD ---
 try:
     # Load data from Supabase (SQL)
     df_db = fetch_all_artists_df()
@@ -116,6 +109,8 @@ with st.sidebar:
 # --- 3. VISUALIZATION CONTROLLER ---
 if 'view_df' not in st.session_state or st.session_state.view_df.empty:
     if not df_db.empty:
+        # GLOBAL VIEW FIX: Use a random cluster anchor to prevent the 'Hairball' crash
+        
         # Initial Random Cluster View
         sample_size = min(len(df_db), 30)
         sample_df = df_db.sample(n=sample_size)
@@ -224,4 +219,4 @@ if selected:
 
 else:
     if df_db.empty:
-        st.info("The database is empty! Use the sidebar to start your first search.")
+        st.info("The database is empty! Run bulk_harvester.py to seed data.")
