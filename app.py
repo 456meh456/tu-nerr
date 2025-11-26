@@ -3,7 +3,7 @@ import pandas as pd
 import time
 
 # --- IMPORT MODULES ---
-# We now import from db_model (SQL) instead of data_model (GSheets)
+# We now import from db_model (Supabase/SQL)
 from src.db_model import fetch_all_artists_df, delete_artist
 from src.api_handler import get_similar_artists, get_top_artists_by_genre, process_artist, get_artist_details, get_top_tracks, get_deezer_data, get_deezer_preview
 from src.ai_engine import get_ai_neighbors, generate_territory_map
@@ -21,6 +21,7 @@ def run_discovery(center, mode, api_key, df_db):
     with st.spinner(f"Scanning: {center}..."):
         if mode == "Artist":
             targets.append(center) # The center node itself
+            # Increase limit to force deeper search
             similar = get_similar_artists(center, api_key, limit=20) 
             targets.extend(similar)
         else:
@@ -32,12 +33,14 @@ def run_discovery(center, mode, api_key, df_db):
     prog = st.progress(0)
     
     # Create a set of existing lowercase names to prevent re-processing known bands during this session
+    # Note: df_db comes from SQL now
     session_added_set = set(df_db['Artist_Lower'].tolist()) if not df_db.empty else set()
         
     for i, artist in enumerate(targets):
         prog.progress((i + 1) / len(targets))
         
         # Process: Checks DB -> Fetches API -> Analyzes Audio -> Saves to SQL
+        # process_artist in api_handler now handles the SQL inserts via db_model
         data = process_artist(artist, df_db, api_key, session_added_set)
         if data: 
             session_data.append(data)
@@ -49,9 +52,10 @@ def run_discovery(center, mode, api_key, df_db):
         return True
     return False
 
-# --- 1. INITIAL LOAD ---
+# --- 1. INITIAL LOAD (FROM SUPABASE) ---
 try:
     # Load data from Supabase (SQL)
+    # This function maps the SQL columns (avg_bpm) to App columns (Audio_BPM)
     df_db = fetch_all_artists_df()
 except Exception as e:
     st.error(f"FATAL DB ERROR: Failed to load initial data. Details: {e}")
@@ -61,6 +65,10 @@ except Exception as e:
 with st.sidebar:
     st.header("🚀 Discovery Engine")
     
+    if st.button("🔄 Refresh Data"):
+        st.cache_data.clear()
+        st.rerun()
+
     with st.form(key='search'):
         mode = st.radio("Search By:", ["Artist", "Genre"])
         query = st.text_input(f"Enter {mode} Name:")
@@ -73,7 +81,7 @@ with st.sidebar:
                 except Exception as e: st.error(f"Search error: {e}")
     
     st.divider()
-    if st.button("🔄 Reset Map"):
+    if st.button("🔄 Reset / Global Map"):
         if 'view_df' in st.session_state: del st.session_state['view_df']
         if 'center_node' in st.session_state: del st.session_state['center_node']
         st.rerun()
@@ -90,6 +98,7 @@ with st.sidebar:
                 if delete_artist(artist_del):
                     st.success(f"Deleted {artist_del}")
                     time.sleep(1)
+                    st.cache_data.clear()
                     st.rerun()
                 else:
                     st.error("Delete failed.")
@@ -97,8 +106,9 @@ with st.sidebar:
 # --- 3. VISUALIZATION CONTROLLER ---
 if 'view_df' not in st.session_state or st.session_state.view_df.empty:
     if not df_db.empty:
-        # Phase 3 Upgrade: Use UMAP for Global View instead of Random Sample
-        with st.spinner("Calculating Universal Territory Map..."):
+        # GLOBAL VIEW: Calculate UMAP Territory
+        with st.spinner("Calculating AI Territory Map..."):
+            # This adds 'UMAP_X' and 'UMAP_Y' columns to the dataframe
             st.session_state.view_df = generate_territory_map(df_db)
         
         st.session_state.center_node = None
@@ -110,7 +120,7 @@ disp_df = st.session_state.view_df
 center = st.session_state.get('center_node', 'Unknown')
 source = st.session_state.get('view_source', 'Social')
 
-st.subheader(f"🔭 System: {center if center else 'Universal Galaxy'} ({source})")
+st.subheader(f"🔭 System: {center if center else 'Universal Galaxy'} ({source} Connection)")
 
 selected = None
 if not disp_df.empty:
@@ -175,14 +185,15 @@ if selected:
             audio_b = float(r.get('Audio_Brightness', 0))
             tag_e = float(r.get('Tag_Energy', 0.5))
             energy = audio_b if audio_b > 0 else tag_e
+            v_val = float(r.get('Valence', 0.5))
             
             st.metric("Fans", f"{int(r['Monthly Listeners']):,}")
             st.metric("BPM", int(r.get('Audio_BPM', 0)))
             
             st.caption(f"🔥 Energy (Intensity): {energy:.2f}")
             st.progress(energy)
-            st.caption(f"😊 Mood (Happiness): {float(r['Valence']):.2f}")
-            st.progress(float(r['Valence']))
+            st.caption(f"😊 Mood (Happiness): {v_val:.2f}")
+            st.progress(v_val)
 
         # COLUMN 2: Bio & Top Tracks
         with col2:

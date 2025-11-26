@@ -5,122 +5,121 @@ import numpy as np
 
 def render_graph(disp_df, center, source):
     """
-    Renders the interactive AgGraph network view, distinguishing between 
-    Solar System (Search) and Galaxy (Global) views.
+    Renders the interactive AgGraph network view.
+    Handles both Solar System (Physics) and Territory Map (Fixed X/Y).
     """
     
     nodes = []
     edges = []
     added_node_ids = set() 
 
-    # Determine if we are in a focused search mode or global view
     is_search_mode = source in ["Social", "AI (Audio)"]
     real_center_id = None
     
+    # 1. ESTABLISH CENTER (For Solar System View)
     if center:
-        # 1. ESTABLISH THE CENTER (THE SUN)
         center_row = disp_df[disp_df['Artist'].astype(str).str.lower() == str(center).lower()]
-        
         if not center_row.empty:
             r = center_row.iloc[0]
             real_center_id = r['Artist']
             
-            # --- IMAGE FIX: Robustly get image URL ---
-            center_image_url = r.get('Image URL', "https://placehold.co/80x80/000/FFF?text=TARGET")
-            # Fallback for old/corrupt placeholder data
-            if str(center_image_url).startswith("https://commons.wikimedia"): 
-                 center_image_url = "https://placehold.co/80x80/000/FFF?text=TARGET"
-            
-            # VISUALS FOR CENTER NODE
-            energy_val = float(r.get('Audio_Brightness', 0) or r.get('Tag_Energy', 0.5))
+            # Visuals for Center
             bpm = int(r.get('Audio_BPM', 0))
+            e_val = float(r.get('Audio_Brightness', 0) or r.get('Tag_Energy', 0.5))
+            border = "#E74C3C" if e_val > 0.7 else "#2ECC71" if e_val < 0.4 else "#F1C40F"
             
-            if energy_val > 0.75: border_color = "#E74C3C" # Red
-            elif energy_val < 0.4: border_color = "#2ECC71" # Green
-            else: border_color = "#F1C40F" # Yellow
-            
+            # Fix Image
+            img = r.get('Image URL')
+            if not img or "placeholder" in str(img): img = "https://placehold.co/80x80/000/FFF?text=ARTIST"
+
             nodes.append(Node(
                 id=real_center_id,
                 label=real_center_id,
                 size=80,
                 shape="circularImage",
-                image=center_image_url,
+                image=img,
                 title=f"CENTER\nGenre: {r['Genre']}\nBPM: {bpm}",
                 borderWidth=6,
-                color={'border': border_color}
+                color={'border': border}
             ))
             added_node_ids.add(real_center_id)
-        else:
-            # Ghost Sun (Center not found in this specific dataframe slice)
-            real_center_id = center
-            nodes.append(Node(id=real_center_id, label=real_center_id, size=80, shape="circularImage", image="https://placehold.co/80x80/000/FFF?text=SCANNING", title="Target Artist (Data Loading...)", borderWidth=4, color={'border': '#FFFFFF'}))
-            added_node_ids.add(real_center_id)
 
-
-    # 2. CREATE NEIGHBOR NODES (THE PLANETS)
+    # 2. CREATE NODES
     for i, r in disp_df.iterrows():
         artist_name = r['Artist']
         if artist_name in added_node_ids: continue
         
-        # Sizing based on Listeners
+        # Sizing
         listeners = r.get('Monthly Listeners', 0)
-        size = 30
-        if listeners > 10_000_000: size = 60
-        elif listeners > 1_000_000: size = 45
+        size = 25
+        if listeners > 10_000_000: size = 50
+        elif listeners > 1_000_000: size = 35
 
-        # Vibe Coloring
-        audio_bright = r.get('Audio_Brightness', 0)
-        tag_e = r.get('Tag_Energy', 0.5)
-        energy_val = float(audio_bright or tag_e)
-        
-        if energy_val > 0.75: border_color = "#E74C3C"
-        elif energy_val < 0.4: border_color = "#2ECC71"
-        else: border_color = "#F1C40F"
+        # Coloring
+        e_val = float(r.get('Audio_Brightness', 0) or r.get('Tag_Energy', 0.5))
+        border = "#E74C3C" if e_val > 0.7 else "#2ECC71" if e_val < 0.4 else "#F1C40F"
 
-        # Image Lookup for Neighbors
-        neighbor_image_url = r.get('Image URL', "https://placehold.co/80x80/000/FFF?text=NODE")
+        # Image
+        img = r.get('Image URL')
+        if not img or "placeholder" in str(img): img = "https://placehold.co/80x80/000/FFF?text=NODE"
+
+        # COORDINATES (The UMAP Upgrade)
+        # If UMAP data exists, we scale it up (UMAP is usually -1 to 1, AgGraph needs pixels)
+        x_pos = None
+        y_pos = None
+        if 'UMAP_X' in r and not pd.isna(r['UMAP_X']):
+            x_pos = float(r['UMAP_X']) * 500 # Scale factor
+            y_pos = float(r['UMAP_Y']) * 500
 
         nodes.append(Node(
             id=artist_name,
             label=artist_name,
             size=size,
             shape="circularImage",
-            image=neighbor_image_url,
-            title=f"Genre: {r['Genre']}\nBPM: {int(r.get('Audio_BPM', 0))}\nEnergy: {energy_val:.2f}",
-            borderWidth=4,
-            color={"border": border_color}
+            image=img,
+            title=f"Genre: {r['Genre']}\nBPM: {int(r.get('Audio_BPM', 0))}",
+            borderWidth=3,
+            color={"border": border},
+            x=x_pos, # Apply UMAP coordinates
+            y=y_pos
         ))
         added_node_ids.add(artist_name)
     
-    # 3. DRAW EDGES (GRAVITY)
+    # 3. EDGES & PHYSICS CONFIG
+    # If we have UMAP coordinates, we turn OFF physics so nodes stay in their smart clusters.
+    # If we are searching, we turn ON physics so they float around the center.
+    
+    use_physics = True
+    
     if is_search_mode and real_center_id:
-        # A. SEARCH MODE: Star Topology (Everything connects to Center)
+        # SOLAR SYSTEM (Physics ON)
         for i, r in disp_df.iterrows():
-            target_id = r['Artist']
-            if target_id != real_center_id and target_id in added_node_ids:
-                # Differentiate edge color for AI results vs Social results
+            if r['Artist'] != real_center_id and r['Artist'] in added_node_ids:
                 edge_color = "#FF4B4B" if source == "AI (Audio)" else "#555555"
-                edges.append(Edge(source=real_center_id, target=target_id, color=edge_color))
-
-    else: 
-        # B. GLOBAL MODE: Cluster Topology (Connect to Genres/Floating Galaxy)
-        genres = disp_df['Genre'].unique()
-        for g in genres:
-            nodes.append(Node(id=f"g_{g}", label=g, size=20, color="#f1c40f", shape="star", physics=False))
-            
-        for i, r in disp_df.iterrows():
-            edges.append(Edge(source=r['Artist'], target=f"g_{r['Genre']}", color="#333333", length=150))
+                edges.append(Edge(source=real_center_id, target=r['Artist'], color=edge_color))
+    else:
+        # GLOBAL TERRITORY (Physics OFF - use UMAP positions)
+        if 'UMAP_X' in disp_df.columns:
+            use_physics = False 
+            # We don't draw edges in Territory view to avoid clutter
+        else:
+            # Fallback to Genre clusters if UMAP failed
+            genres = disp_df['Genre'].unique()
+            for g in genres:
+                nodes.append(Node(id=f"g_{g}", label=g, size=15, color="#f1c40f", shape="star"))
+            for i, r in disp_df.iterrows():
+                edges.append(Edge(source=r['Artist'], target=f"g_{r['Genre']}", color="#333333"))
 
     # 4. RENDER CONFIG
     config = Config(
         width="100%", 
         height=700, 
         directed=False, 
-        physics=True, 
+        physics=use_physics, # Dynamic Physics toggle
         hierarchical=False, 
         collapsible=True,
         physicsOptions={
-            "barnesHut": {"gravitationalConstant": -10000, "centralGravity": 0.05, "springLength": 100, "damping": 0.5},
+            "barnesHut": {"gravitationalConstant": -4000, "centralGravity": 0.1, "springLength": 120, "damping": 0.4},
             "stabilization": {"iterations": 50}
         }
     )

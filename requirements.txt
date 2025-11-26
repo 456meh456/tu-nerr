@@ -9,3 +9,4 @@ scikit-learn
 scipy
 librosa
 numpy
+umap-learn
