@@ -32,9 +32,10 @@ def run_discovery(center, mode, api_key, df_db):
     session_data = []
     prog = st.progress(0)
     
-    # Create a set of existing lowercase names to prevent re-processing known bands during this session
-    # Note: df_db comes from SQL now
-    session_added_set = set(df_db['Artist_Lower'].tolist()) if not df_db.empty else set()
+    # FIX: Initialize as empty set so we retrieve existing bands from DB for display
+    # instead of skipping them. Deduplication happens in process_artist (DB check)
+    # and at the end of this function (DataFrame drop_duplicates).
+    session_added_set = set()
         
     for i, artist in enumerate(targets):
         prog.progress((i + 1) / len(targets))
@@ -44,6 +45,9 @@ def run_discovery(center, mode, api_key, df_db):
         data = process_artist(artist, df_db, api_key, session_added_set)
         if data: 
             session_data.append(data)
+            # Mark as processed in this specific run loop to avoid re-processing 
+            # if duplicates exist within the targets list itself
+            session_added_set.add(artist.strip().lower())
     
     if session_data:
         st.session_state.view_df = pd.DataFrame(session_data).drop_duplicates(subset=['Artist'])
