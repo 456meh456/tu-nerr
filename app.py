@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
 import time
-import random 
 
 # --- IMPORT MODULES ---
 from src.db_model import fetch_all_artists_df, delete_artist
@@ -15,36 +14,36 @@ st.title("🎵 tu-nerr: The Discovery Engine")
 
 # --- CORE LOGIC FLOW ---
 
-def run_discovery_and_commit(center, mode, api_key, df_db):
-    """
-    Original function for committing NEW data. This is only called when 
-    a user launches a search for a band that may be missing.
-    """
+def run_discovery(center, mode, api_key, df_db):
+    """Central logic for finding and processing a cluster of artists."""
     targets = []
     with st.spinner(f"Scanning: {center}..."):
         if mode == "Artist":
-            targets.append(center) # The center node itself
-            # Increase limit to force deeper search
+            targets.append(center)
             similar = get_similar_artists(center, api_key, limit=20) 
             targets.extend(similar)
         else:
             targets = get_top_artists_by_genre(center, api_key, limit=20)
     
-    targets = list(set(targets)) # Deduplicate initial targets
+    targets = list(set(targets))
 
     session_data = []
     prog = st.progress(0)
     
-    # Create a set of existing lowercase names to prevent re-processing known bands during this session
-    session_added_set = set(df_db['Artist_Lower'].tolist()) if not df_db.empty else set()
+    # Initialize set to track processed artists during this run
+    session_added_set = set()
         
     for i, artist in enumerate(targets):
         prog.progress((i + 1) / len(targets))
         
-        # Process: Checks DB -> Fetches API -> Analyzes Audio -> Saves to SQL (SLOW PATH)
+        if artist.strip().lower() in session_added_set: continue
+            
+        # Process: Checks DB -> Fetches API -> Analyzes Audio -> Saves to SQL
         data = process_artist(artist, df_db, api_key, session_added_set)
+        
         if data: 
             session_data.append(data)
+            session_added_set.add(data['Artist'].lower())
     
     if session_data:
         st.session_state.view_df = pd.DataFrame(session_data).drop_duplicates(subset=['Artist'])
@@ -57,6 +56,13 @@ def run_discovery_and_commit(center, mode, api_key, df_db):
         st.session_state.view_source = "Social"
         return True
     return False
+
+def run_discovery_and_commit(center, mode, api_key, df_db):
+    """
+    Original function for committing NEW data. This is only called when 
+    a user launches a search for a band that may be missing.
+    """
+    return run_discovery(center, mode, api_key, df_db)
 
 # --- 1. INITIAL LOAD ---
 try:
@@ -129,16 +135,22 @@ with st.sidebar:
                     else:
                         # 3. If new, run the slow commit path
                         if run_discovery_and_commit(query, mode, key, df_db): 
-                            st.success(f"Artist '{query}' successfully analyzed and added to the database. Refreshing map...")
                             st.rerun()
                         else: 
-                            # 4. FIX: Provide instructions for manual harvest
-                            st.error(f"'{query}' not found by APIs. If the band exists, please run the 'bulk_harvester.py' script locally to attempt addition.")
-                            
+                            st.error(f"'{query}' not found. It will be added to the harvest queue. Please check back in 5 minutes.")
 
                 except Exception as e: st.error(f"Search error: {e}")
     
     st.divider()
+    
+    # --- NEW: TEXTURE SLIDER ---
+    st.subheader("🎛️ Vibe Filters")
+    # Default 0.0 to 1.0 shows everything. User can constrict the range.
+    texture_range = st.slider("Texture (Noisiness)", 0.0, 1.0, (0.0, 1.0), 
+                              help="Filter by rhythmic density. Low = Melodic/Smooth. High = Percussive/Rap.")
+
+    st.divider()
+    
     if st.button("🔄 Reset / Global Map"):
         st.session_state.initial_run_complete = False 
         if 'view_df' in st.session_state: del st.session_state['view_df']
@@ -167,17 +179,28 @@ disp_df = st.session_state.get('view_df', pd.DataFrame())
 center = st.session_state.get('center_node', 'Unknown')
 source = st.session_state.get('view_source', 'Social')
 
+# --- FILTER LOGIC ---
+if not disp_df.empty and 'Audio_Noisiness' in disp_df.columns:
+    # Apply the slider filter to the dataframe before rendering
+    min_noise, max_noise = texture_range
+    disp_df = disp_df[
+        (disp_df['Audio_Noisiness'] >= min_noise) & 
+        (disp_df['Audio_Noisiness'] <= max_noise)
+    ]
+
 st.subheader(f"🔭 System: {center if center else 'Universal Galaxy'} ({source} Connection)")
 
 selected = None
 if not disp_df.empty:
     selected = render_graph(disp_df, center, source)
+elif not df_db.empty:
+    st.warning("No artists match your current Texture Filter.")
 
 # --- 5. DASHBOARD ---
 
 # Auto-select the center node for the dashboard immediately after search/load
 if not selected and center and center != 'Unknown':
-    if not disp_df[disp_df['Artist'].str.lower() == center.lower()].empty:
+    if not disp_df.empty and not disp_df[disp_df['Artist'].str.lower() == center.lower()].empty:
         selected = center 
 
 if selected:
@@ -187,7 +210,10 @@ if selected:
     with c2:
         # 1. TRAVEL BUTTON
         if st.button("🔭 Travel Here (Social)", type="primary"):
-            run_discovery_and_commit(selected, "Artist", st.secrets["lastfm_key"], df_db)
+            # If traveling, we run the fast read function
+            st.session_state.view_df = get_neighbors_for_view(selected, "Artist", st.secrets["lastfm_key"], df_db)
+            st.session_state.center_node = selected
+            st.session_state.view_source = "Social"
             st.rerun()
             
         # 2. AI BUTTON
@@ -202,6 +228,7 @@ if selected:
             else: st.error("Not enough data for AI analysis. (Need 5+ bands)")
 
     try:
+        # Load detailed row data from DB
         row = df_db[df_db['Artist'] == selected]
         
         # Handle case where selected node is in graph but not in current DB snapshot
@@ -210,7 +237,8 @@ if selected:
             r = {
                 'Image URL': d_live['image'] if d_live else '',
                 'Audio_BPM': 0, 'Audio_Brightness': 0.5, 'Tag_Energy': 0.5, 'Valence': 0.5,
-                'Monthly Listeners': d_live['listeners'] if d_live else 0, 'Genre': 'Unknown'
+                'Monthly Listeners': d_live['listeners'] if d_live else 0, 'Genre': 'Unknown',
+                'Audio_Noisiness': 0.5 # Default for unknown
             }
         else:
             r = row.iloc[0]
@@ -236,6 +264,7 @@ if selected:
             tag_e = float(r.get('Tag_Energy', 0.5))
             energy = audio_b if audio_b > 0 else tag_e
             v_val = float(r.get('Valence', 0.5))
+            noise = float(r.get('Audio_Noisiness', 0))
             
             st.metric("Fans", f"{int(r['Monthly Listeners']):,}")
             st.metric("BPM", int(r.get('Audio_BPM', 0)))
@@ -244,6 +273,8 @@ if selected:
             st.progress(energy)
             st.caption(f"😊 Mood (Happiness): {v_val:.2f}")
             st.progress(v_val)
+            st.caption(f"🌊 Texture (Noisiness): {noise:.2f}")
+            st.progress(noise)
 
         # COLUMN 2: Bio & Top Tracks
         with col2:
@@ -257,7 +288,7 @@ if selected:
             
             if tracks:
                 t_data = [{"Song": t['name'], "Plays": f"{int(t['playcount']):,}", "Link": t.get('url', '#')} for t in tracks]
-                st.dataframe(pd.DataFrame(t_data), column_config={"Link": st.column_config.LinkColumn("Listen")}, hide_index=True)
+                st.dataframe(pd.DataFrame(t_data), column_config={"Link": st.column_config.LinkColumn("Link")}, hide_index=True)
 
     except Exception as e:
         st.error(f"Dashboard Load Error: {e}")

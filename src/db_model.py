@@ -6,7 +6,7 @@ import streamlit as st
 import numpy as np
 import ssl
 
-# --- SSL MONKEY PATCH (Standard for Httpx/Supabase) ---
+# --- SSL MONKEY PATCH ---
 try:
     _create_unverified_https_context = ssl._create_unverified_context
 except AttributeError:
@@ -15,17 +15,13 @@ else:
     ssl._create_default_https_context = _create_unverified_https_context
 
 # --- CONNECTION FACTORY ---
-# (Omitted - Assumed Correct)
-
 def get_supabase_client():
-    # ... (Connection logic remains the same) ...
+    """Initializes the Supabase client from secrets."""
     try:
-        # 1. Try Streamlit Cloud Secrets (Production)
         if hasattr(st, "secrets") and "supabase" in st.secrets:
             url = st.secrets["supabase"]["url"]
             key = st.secrets["supabase"]["key"]
         else:
-            # 2. Try Local Secrets (Development/Scripts)
             secrets_path = os.path.join(os.getcwd(), ".streamlit", "secrets.toml")
             if os.path.exists(secrets_path):
                 secrets = toml.load(secrets_path)
@@ -40,16 +36,17 @@ def get_supabase_client():
         return None
 
 # --- CORE OPERATIONS (SQL) ---
+
 def add_artist(data):
     """Inserts a new artist (if not exists) and returns their ID."""
     supabase = get_supabase_client()
     if not supabase: raise ConnectionError("Supabase client is not available.")
 
-    # 1. Check if artist exists
+    # Check if artist exists
     existing = supabase.table("artists").select("id").eq("name", data['Artist']).execute()
     
     if existing.data:
-        # If artist exists, we update the missing field
+        # Update existing (Upsert logic)
         update_payload = {
             "first_release_year": data.get('First Release Year'),
             "listeners": int(data.get('Monthly Listeners', 0)),
@@ -57,35 +54,31 @@ def add_artist(data):
             "tag_energy": float(data.get('Tag_Energy', 0.5)),
             "valence": float(data.get('Valence', 0.5)),
         }
-        
-        # Use primary key for update
         supabase.table("artists").update(update_payload).eq("id", existing.data[0]['id']).execute()
         return existing.data[0]['id']
 
-    # 2. Prepare Payload for Insertion (NEW ARTIST)
+    # Insert new
     payload = {
         "name": data['Artist'],
         "genre": data.get('Genre', 'Unknown'),
         "listeners": int(data.get('Monthly Listeners', 0)),
         "image_url": data.get('Image URL', ''),
-        "first_release_year": data.get('First Release Year'), # <-- NEW
+        "first_release_year": data.get('First Release Year'), 
         "valence": float(data.get('Valence', 0.5)),
         "tag_energy": float(data.get('Tag_Energy', 0.5))
     }
     
-    # 3. Insert and return ID
     response = supabase.table("artists").insert(payload).execute()
     return response.data[0]['id'] if response.data else None
 
 def add_track(artist_id, track_data):
-    # ... (Code unchanged, omitted for space)
     supabase = get_supabase_client()
     if not supabase: return
 
     payload = {
         "artist_id": artist_id,
         "title": track_data.get('title', 'Unknown'),
-        "preview_url": track_data.get('preview', ''),
+        "preview_url": track_data.get('preview_url', ''),
         "bpm": float(track_data.get('bpm', 0)),
         "brightness": float(track_data.get('brightness', 0)),
         "noisiness": float(track_data.get('noisiness', 0)),
@@ -95,7 +88,6 @@ def add_track(artist_id, track_data):
     supabase.table("tracks").insert(payload).execute()
 
 def synthesize_scores(artist_id):
-    # ... (Code unchanged, omitted for space)
     supabase = get_supabase_client()
     if not supabase: return
 
@@ -117,10 +109,8 @@ def synthesize_scores(artist_id):
     supabase.table("artists").update(update_payload).eq("id", artist_id).execute()
 
 def delete_artist(artist_name):
-    # ... (Code unchanged, omitted for space)
     supabase = get_supabase_client()
     if not supabase: return False
-
     try:
         supabase.table("artists").delete().eq("name", artist_name).execute()
         return True
@@ -128,13 +118,13 @@ def delete_artist(artist_name):
         return False
 
 def fetch_all_artists_df():
-    # ... (Code unchanged, omitted for space)
+    """Returns the main dataframe for the App Visualization."""
     supabase = get_supabase_client()
     if not supabase: raise ConnectionError("Supabase client is not available.")
     
-    # Select columns needed for visualization
+    # FIX: Added avg_noisiness, avg_warmth, avg_complexity to selection
     response = supabase.table("artists").select(
-        "name, genre, listeners, avg_brightness, valence, avg_bpm, image_url, tag_energy, first_release_year"
+        "name, genre, listeners, avg_brightness, valence, avg_bpm, image_url, tag_energy, first_release_year, avg_noisiness, avg_warmth, avg_complexity"
     ).execute()
     
     df = pd.DataFrame(response.data)
@@ -145,7 +135,10 @@ def fetch_all_artists_df():
         "name": "Artist", "genre": "Genre", "listeners": "Monthly Listeners",
         "avg_brightness": "Audio_Brightness", "valence": "Valence",
         "avg_bpm": "Audio_BPM", "image_url": "Image URL", "tag_energy": "Tag_Energy",
-        "first_release_year": "First Release Year"
+        "first_release_year": "First Release Year",
+        "avg_noisiness": "Audio_Noisiness",   # NEW
+        "avg_warmth": "Audio_Warmth",         # NEW
+        "avg_complexity": "Audio_Complexity"  # NEW
     })
     
     df['Artist_Lower'] = df['Artist'].str.lower()
