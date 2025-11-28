@@ -3,7 +3,7 @@ Secrets (NEVER upload these)
 .streamlit/secrets.toml
 client_secret_.json
 tu-nerr-bot-.json
-
+backsups/
 System files
 
 pycache/

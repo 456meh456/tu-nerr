@@ -5,7 +5,7 @@ import random
 
 # --- IMPORT MODULES ---
 from src.db_model import fetch_all_artists_df, delete_artist
-from src.api_handler import get_similar_artists, get_top_artists_by_genre, process_artist, get_artist_details, get_top_tracks, get_deezer_data, get_deezer_preview
+from src.api_handler import get_similar_artists, get_top_artists_by_genre, process_artist, get_artist_details, get_top_tracks, get_deezer_data, get_deezer_preview, get_neighbors_for_view
 from src.ai_engine import get_ai_neighbors, generate_territory_map
 from src.visuals import render_graph 
 
@@ -15,12 +15,16 @@ st.title("🎵 tu-nerr: The Discovery Engine")
 
 # --- CORE LOGIC FLOW ---
 
-def run_discovery(center, mode, api_key, df_db):
-    """Central logic for finding and processing a cluster of artists."""
+def run_discovery_and_commit(center, mode, api_key, df_db):
+    """
+    Original function for committing NEW data. This is only called when 
+    a user launches a search for a band that may be missing.
+    """
     targets = []
     with st.spinner(f"Scanning: {center}..."):
         if mode == "Artist":
             targets.append(center) # The center node itself
+            # Increase limit to force deeper search
             similar = get_similar_artists(center, api_key, limit=20) 
             targets.extend(similar)
         else:
@@ -37,7 +41,7 @@ def run_discovery(center, mode, api_key, df_db):
     for i, artist in enumerate(targets):
         prog.progress((i + 1) / len(targets))
         
-        # Process: Checks DB -> Fetches API -> Analyzes Audio -> Saves to SQL
+        # Process: Checks DB -> Fetches API -> Analyzes Audio -> Saves to SQL (SLOW PATH)
         data = process_artist(artist, df_db, api_key, session_added_set)
         if data: 
             session_data.append(data)
@@ -45,11 +49,10 @@ def run_discovery(center, mode, api_key, df_db):
     if session_data:
         st.session_state.view_df = pd.DataFrame(session_data).drop_duplicates(subset=['Artist'])
         
-        # Set the center node explicitly after a successful search
         if mode == "Artist":
             st.session_state.center_node = center
         else:
-            st.session_state.center_node = None # For Genre searches
+            st.session_state.center_node = None
             
         st.session_state.view_source = "Social"
         return True
@@ -63,47 +66,39 @@ except Exception as e:
     st.stop()
 
 # --- 2. INITIAL VIEW STATE CHECK ---
-# Check 1: Has the app loaded before? (Prevents infinite loop)
 if 'initial_run_complete' not in st.session_state:
     st.session_state.initial_run_complete = False
 
-# Check 2: If the session has no data AND the initial run hasn't finished, run the setup.
 if 'view_df' not in st.session_state and not st.session_state.initial_run_complete:
     if not df_db.empty:
-        # --- FIX IMPLEMENTATION: RETRY LOGIC ---
+        # Initial Random Cluster View
         MAX_RETRIES = 3
         
         for attempt in range(MAX_RETRIES):
-            # Select a random artist to be the anchor
-            sample_df = df_db.sample(min(len(df_db), 30))
-            random_center = sample_df.sort_values('Monthly Listeners', ascending=False).iloc[0]['Artist']
-            
             try:
+                sample_df = df_db.sample(min(len(df_db), 30))
+                random_center = sample_df.sort_values('Monthly Listeners', ascending=False).iloc[0]['Artist']
+                
                 key = st.secrets["lastfm_key"]
                 st.cache_data.clear() 
                 
-                # Run the discovery sequence (network intensive part)
-                if run_discovery(random_center, "Artist", key, df_db):
-                     # Success: Set state flag and force refresh to render clean map
+                # FIX: We now call the fast read path for the initial view
+                st.session_state.view_df = get_neighbors_for_view(random_center, "Artist", key, df_db)
+                
+                if not st.session_state.view_df.empty:
+                     st.session_state.center_node = random_center
+                     st.session_state.view_source = "Random Cluster"
                      st.session_state.initial_run_complete = True
                      st.rerun() 
-                     break # Exit the retry loop on success
+                     break
                 else:
-                    # Log failure to find neighbors for this anchor artist
-                    print(f"Initial Load Attempt {attempt + 1}: Neighbors not found for {random_center}.")
                     time.sleep(0.5)
-
-            except Exception as e:
-                 # Log fatal crash (usually networking) and retry
-                 print(f"Initial Load Attempt {attempt + 1}: CRASHED ({e}). Retrying...")
+            except Exception:
                  time.sleep(1)
         
-        # FINAL FALLBACK if all retries fail
         if not st.session_state.initial_run_complete:
             st.session_state.view_df = pd.DataFrame()
             st.error("Initial load failed after 3 attempts. Please try manual search.")
-        
-
 
 # --- 3. SIDEBAR (CONTROLS) ---
 with st.sidebar:
@@ -120,15 +115,31 @@ with st.sidebar:
             if query:
                 try:
                     key = st.secrets["lastfm_key"]
-                    # Before running discovery, clear the cache to ensure we get a fresh DB load during the run
                     st.cache_data.clear() 
-                    if run_discovery(query, mode, key, df_db): st.rerun()
-                    else: st.error("No data found.")
+                    
+                    # 1. Check if artist is known
+                    is_known = query.lower() in df_db['Artist_Lower'].tolist()
+                    
+                    if is_known:
+                        # 2. If known, run the fast read path
+                        st.session_state.view_df = get_neighbors_for_view(query, mode, key, df_db)
+                        st.session_state.center_node = query
+                        st.session_state.view_source = "Social"
+                        st.rerun()
+                    else:
+                        # 3. If new, run the slow commit path
+                        if run_discovery_and_commit(query, mode, key, df_db): 
+                            st.success(f"Artist '{query}' successfully analyzed and added to the database. Refreshing map...")
+                            st.rerun()
+                        else: 
+                            # 4. FIX: Provide instructions for manual harvest
+                            st.error(f"'{query}' not found by APIs. If the band exists, please run the 'bulk_harvester.py' script locally to attempt addition.")
+                            
+
                 except Exception as e: st.error(f"Search error: {e}")
     
     st.divider()
-    if st.button("🔄 Reset Map"):
-        # Reset flag to allow the initial load logic to run again
+    if st.button("🔄 Reset / Global Map"):
         st.session_state.initial_run_complete = False 
         if 'view_df' in st.session_state: del st.session_state['view_df']
         if 'center_node' in st.session_state: del st.session_state['center_node']
@@ -152,7 +163,7 @@ with st.sidebar:
                     st.error("Delete failed.")
 
 # --- 4. VISUALIZATION CONTROLLER ---
-disp_df = st.session_state.view_df
+disp_df = st.session_state.get('view_df', pd.DataFrame())
 center = st.session_state.get('center_node', 'Unknown')
 source = st.session_state.get('view_source', 'Social')
 
@@ -160,16 +171,14 @@ st.subheader(f"🔭 System: {center if center else 'Universal Galaxy'} ({source}
 
 selected = None
 if not disp_df.empty:
-    # Render the graph via the visuals module
     selected = render_graph(disp_df, center, source)
 
 # --- 5. DASHBOARD ---
 
 # Auto-select the center node for the dashboard immediately after search/load
-if selected:
-    pass 
-elif center and center != 'Unknown':
-    selected = center # Fallback: use the center node as the default selected item
+if not selected and center and center != 'Unknown':
+    if not disp_df[disp_df['Artist'].str.lower() == center.lower()].empty:
+        selected = center 
 
 if selected:
     st.divider()
@@ -178,7 +187,7 @@ if selected:
     with c2:
         # 1. TRAVEL BUTTON
         if st.button("🔭 Travel Here (Social)", type="primary"):
-            run_discovery(selected, "Artist", st.secrets["lastfm_key"], df_db)
+            run_discovery_and_commit(selected, "Artist", st.secrets["lastfm_key"], df_db)
             st.rerun()
             
         # 2. AI BUTTON
@@ -193,12 +202,10 @@ if selected:
             else: st.error("Not enough data for AI analysis. (Need 5+ bands)")
 
     try:
-        # Load detailed row data from DB
         row = df_db[df_db['Artist'] == selected]
         
         # Handle case where selected node is in graph but not in current DB snapshot
         if row.empty:
-            # Fallback: Fetch live minimal data
             d_live = get_deezer_data(selected)
             r = {
                 'Image URL': d_live['image'] if d_live else '',

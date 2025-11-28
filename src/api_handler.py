@@ -2,23 +2,42 @@ import pandas as pd
 import requests
 import time
 import urllib3
+import toml
 import os
 import tempfile
 import numpy as np
 import librosa
 import json
 import streamlit as st
+import sys # For error printing
 from src.db_model import add_artist, add_track, synthesize_scores, fetch_all_artists_df
 
 # Disable SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# --- CONFIGURATION ---
-LIVE_TRACK_LIMIT = 5 # UPDATED: Analyze 5 tracks for better data quality (slower but accurate)
+# --- CONFIGURATION (Shared Constants) ---
+AUDIODB_API_KEY = "2" # Public API key for AudioDB
+LIVE_TRACK_LIMIT = 5
+
+# FINAL CALIBRATION CONSTANTS (Derived from Audit)
+# These constants ensure the raw Librosa values (Centroid, ZCR, etc.) are scaled between 0 and 1.
+COMPLEXITY_DIVISOR = 0.3115 
+NOISINESS_DIVISOR = 0.1771 
+BRIGHTNESS_DIVISOR = 3569.1107 
+WARMTH_DIVISOR = 7967.8935 
+
+# Load API Key from secrets (required for local script context)
+SECRETS_PATH = ".streamlit/secrets.toml"
+try:
+    secrets = toml.load(SECRETS_PATH)
+    LASTFM_API_KEY = secrets["lastfm_key"]
+except:
+    LASTFM_API_KEY = "" # Fallback to empty string if secrets fails
 
 # --- API HELPERS ---
 
-def get_similar_artists(artist_name, api_key, limit=10):
+def get_similar_artists(artist_name, api_key, limit=20):
+    """Fetches similar artists from Last.fm (Social recommendation)."""
     url = f"http://ws.audioscrobbler.com/2.0/?method=artist.getsimilar&artist={artist_name}&api_key={api_key}&limit={limit}&format=json"
     try:
         response = requests.get(url, timeout=5)
@@ -26,7 +45,8 @@ def get_similar_artists(artist_name, api_key, limit=10):
     except: pass
     return []
 
-def get_top_artists_by_genre(genre, api_key, limit=12):
+def get_top_artists_by_genre(genre, api_key, limit=20):
+    """Fetches top artists by genre/tag from Last.fm."""
     url = f"http://ws.audioscrobbler.com/2.0/?method=tag.gettopartists&tag={genre}&api_key={api_key}&limit={limit}&format=json"
     try:
         response = requests.get(url, timeout=5)
@@ -35,6 +55,7 @@ def get_top_artists_by_genre(genre, api_key, limit=12):
     return []
 
 def get_artist_details(artist_name, api_key):
+    """Fetches Last.fm bio and raw stats."""
     url = f"http://ws.audioscrobbler.com/2.0/?method=artist.getinfo&artist={artist_name}&api_key={api_key}&format=json"
     try:
         response = requests.get(url, timeout=5)
@@ -43,14 +64,16 @@ def get_artist_details(artist_name, api_key):
     return None
 
 def get_top_tracks(artist_name, api_key):
+    """Fetches top tracks list for dashboard display."""
     url = f"http://ws.audioscrobbler.com/2.0/?method=artist.gettoptracks&artist={artist_name}&api_key={api_key}&limit=5&format=json"
     try:
         response = requests.get(url, timeout=5)
         if response.status_code == 200: return response.json().get('toptracks', {}).get('track', [])
     except: pass
-    return []
+    return None
 
 def get_deezer_preview(artist_id):
+    """Fetches the top track preview URL and title."""
     try:
         url = f"https://api.deezer.com/artist/{artist_id}/top"
         response = requests.get(url, verify=False, timeout=5)
@@ -62,6 +85,7 @@ def get_deezer_preview(artist_id):
     return None
 
 def get_release_year(artist_id):
+    """Fetches the absolute earliest release year via discography scan."""
     earliest_date_str = None
     offset = 0
     limit = 50 
@@ -70,27 +94,40 @@ def get_release_year(artist_id):
     while True:
         try:
             url = f"https://api.deezer.com/artist/{artist_id}/albums?limit={limit}&index={offset}"
-            resp = requests.get(url, headers=headers, verify=False, timeout=5).json()
-            if 'data' not in resp or not resp['data']: break
-            dates = [album.get('release_date') for album in resp['data'] if album.get('release_date')]
+            resp = requests.get(url, headers=headers, verify=False, timeout=5)
+            
+            if resp.status_code != 200: break
+            data = resp.json()
+
+            if 'data' not in data or not data['data']: break
+                
+            dates = [album.get('release_date') for album in data['data'] if album.get('release_date')]
+            
             if dates:
                 current_min_date = min(dates)
                 if earliest_date_str is None or current_min_date < earliest_date_str:
                     earliest_date_str = current_min_date
-            if resp.get('total') is not None and resp['total'] <= offset + limit: break
-            if 'next' in resp: offset += limit
+            
+            if data.get('total') is not None and data['total'] <= offset + limit: break
+            if 'next' in data: offset += limit
             else: break
+            
         except Exception: break 
+
     return int(earliest_date_str[:4]) if earliest_date_str else 0
 
 def get_audiodb_mood(artist_name):
-    AUDIODB_API_KEY = "2" 
+    """Fetches a mood/valence score proxy from the AudioDB API."""
     try:
         url = f"http://www.theaudiodb.com/api/v1/json/{AUDIODB_API_KEY}/search.php?s={artist_name}"
-        resp = requests.get(url, timeout=5).json()
-        if resp.get('artists') and resp['artists']:
-            data = resp['artists'][0]
-            mood_raw = data.get('strMood')
+        resp = requests.get(url, timeout=5)
+        
+        if resp.status_code != 200: return 0.5
+        
+        data = resp.json()
+        if data.get('artists') and data['artists']:
+            mood_raw = data['artists'][0].get('strMood')
+            
             if mood_raw:
                 mood_raw = mood_raw.lower()
                 if 'happy' in mood_raw or 'party' in mood_raw: return 0.8
@@ -101,24 +138,38 @@ def get_audiodb_mood(artist_name):
     except Exception: return 0.5 
 
 def get_deezer_data(artist_name):
+    """Fetches Deezer ID, Listeners, Image, and Preview URL for processing."""
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     try:
         url = f"https://api.deezer.com/search/artist?q={artist_name}"
         response = requests.get(url, headers=headers, verify=False, timeout=5)
-        if response.status_code != 200 or not response.json().get('data'): return None
-        artist = response.json()['data'][0]
+        
+        if response.status_code != 200: return None
+        data = response.json()
+
+        if not data.get('data'): return None
+        artist = data['data'][0]
+        
+        # Get Preview URL & Track ID
+        track_url = f"https://api.deezer.com/artist/{artist['id']}/top?limit=1"
+        t_data = requests.get(track_url, headers=headers, verify=False, timeout=5).json()
+        preview = t_data['data'][0]['preview'] if t_data.get('data') else None
+        top_track_id = t_data['data'][0]['id'] if t_data.get('data') else None
+
         return {
             "name": artist['name'], "id": artist['id'], "listeners": artist['nb_fan'],
-            "image": artist['picture_medium'], "link": artist['link']
+            "image": artist['picture_medium'], "preview": preview, "top_track_id": top_track_id
         }
-    except: return None
+    except Exception: return None
 
-def get_top_tracks_previews(deezer_id, limit=5):
-    """Fetches top tracks (Title + Preview URL) for analysis."""
-    headers = {'User-Agent': 'Mozilla/5.0'}
+def get_top_tracks_previews(deezer_id, limit=LIVE_TRACK_LIMIT):
+    """Fetches top tracks for analysis."""
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     try:
         url = f"https://api.deezer.com/artist/{deezer_id}/top?limit={limit}"
-        resp = requests.get(url, headers=headers, verify=False, timeout=5).json()
+        resp = requests.get(url, headers=headers, verify=False, timeout=5)
+        
+        if resp.status_code != 200: return []
         
         tracks = []
         if resp.get('data'):
@@ -129,32 +180,40 @@ def get_top_tracks_previews(deezer_id, limit=5):
     except: return []
 
 def get_lastfm_tags(artist_name):
+    """Fetches tags and calculates Tag_Energy."""
     try:
-        # HACK: Retrieve API_KEY from secrets if running in the original bare-metal context
-        import toml
-        SECRETS_PATH = ".streamlit/secrets.toml"
-        API_KEY = toml.load(SECRETS_PATH).get("lastfm_key")
+        url = f"http://ws.audioscrobbler.com/2.0/?method=artist.getinfo&artist={artist_name}&api_key={LASTFM_API_KEY}&format=json"
+        resp = requests.get(url, verify=False, timeout=5)
         
-        url = f"http://ws.audioscrobbler.com/2.0/?method=artist.getinfo&artist={artist_name}&api_key={API_KEY}&format=json"
-        resp = requests.get(url, verify=False, timeout=5).json()
-        if 'error' in resp: return [], 0.5
-        tags = [t['name'].lower() for t in resp['artist']['tags']['tag']]
-        ENERGY_SCORES = {'death': 1.0, 'metal': 0.9, 'punk': 0.9, 'rock': 0.7, 'pop': 0.6, 'acoustic': 0.2}
+        if resp.status_code != 200: return [], 0.5
+        
+        data = resp.json()
+        if data.get('error'): return [], 0.5
+        
+        tags = [t['name'].lower() for t in data['artist']['tags']['tag']]
+        
+        VALENCE_SCORES = {'happy': 0.9, 'pop': 0.8, 'sad': 0.2, 'metal': 0.3}
+        ENERGY_SCORES = {'death': 1.0, 'metal': 0.9, 'punk': 0.9, 'rock': 0.7, 'pop': 0.6}
+        
         def score(d):
             hits = [v for k,v in d.items() for t in tags if k in t]
             return sum(hits)/len(hits) if hits else 0.5
+            
         return tags, score(ENERGY_SCORES)
-    except: return [], 0.5
+    except Exception: 
+        return [], 0.5
 
 
-# --- AUDIO ANALYSIS ---
+# --- AUDIO ANALYSIS & DATA PROCESSING ---
 
 def analyze_audio(preview_url):
     tmp_path = None
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+    
     try:
         if not preview_url: return None
-        response = requests.get(preview_url, headers=headers, verify=False, timeout=5) # Short timeout for live app
+        response = requests.get(preview_url, headers=headers, verify=False, timeout=10)
+        
         if response.status_code != 200: return None 
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
@@ -162,36 +221,42 @@ def analyze_audio(preview_url):
             tmp_path = tmp.name
         
         y, sr = librosa.load(tmp_path, duration=30, sr=22050, mono=True)
+        
         onset_env = librosa.onset.onset_strength(y=y, sr=sr)
         tempo = librosa.beat.tempo(onset_envelope=onset_env, sr=sr)
         bpm = round(float(tempo[0])) if isinstance(tempo, np.ndarray) else round(float(tempo))
             
         spectral_centroids = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
         brightness = np.mean(spectral_centroids)
-        norm_brightness = min(brightness / 3000, 1.0)
-
-        zcr = np.mean(librosa.feature.zero_crossing_rate(y))
-        norm_noise = min(zcr * 10, 1.0) 
-
-        rolloff = np.mean(librosa.feature.spectral_rolloff(y=y, sr=sr, roll_percent=0.85)[0])
-        norm_warmth = min(rolloff / 5000, 1.0)
-
+        
+        zcr = librosa.feature.zero_crossing_rate(y)
+        rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr, roll_percent=0.85)[0]
         chroma = librosa.feature.chroma_stft(y=y, sr=sr)
         complexity = np.mean(np.std(chroma, axis=1))
-        norm_complexity = min(complexity * 5, 1.0)
+        
+        # --- FINAL NORMALIZATION ---
+        norm_brightness = min(brightness / BRIGHTNESS_DIVISOR, 1.0)
+        norm_noise = min(np.mean(zcr) / NOISINESS_DIVISOR, 1.0) 
+        norm_warmth = min(np.mean(rolloff) / WARMTH_DIVISOR, 1.0)
+        norm_complexity = min(complexity / COMPLEXITY_DIVISOR, 1.0) 
         
         return {
             "bpm": bpm, "brightness": norm_brightness, "noisiness": norm_noise, 
             "warmth": norm_warmth, "complexity": norm_complexity
         }
-    except Exception: return None 
+    except Exception as e:
+        print(f"Librosa Analysis Failed: {e}", file=sys.stderr, flush=True) 
+        return None
     finally:
         if 'tmp_path' in locals() and os.path.exists(tmp_path):
             try: os.remove(tmp_path)
             except: pass
 
+
 def process_artist(name, df_db, api_key, session_added_set):
-    """Checks DB, fetches API data, analyzes audio (MULTI-TRACK), and saves artist to SQL."""
+    """Checks DB, fetches API data, analyzes audio, and saves artist to SQL."""
+    
+    from src.db_model import add_artist, add_track, synthesize_scores
     
     # 1. Check Local Session (Duplicate Prevention)
     if name.strip().lower() in session_added_set: return None
@@ -201,77 +266,50 @@ def process_artist(name, df_db, api_key, session_added_set):
         if not match.empty: return match.iloc[0].to_dict()
 
     # 2. Fetch Metadata (Deezer/LastFM)
-    deezer_info = get_deezer_data(name)
-    if not deezer_info: return None
-    
-    clean_name = deezer_info['name']
+    d_info = get_deezer_data(name)
+    if not d_info: return None
+    clean_name = d_info['name']
     if clean_name.strip().lower() in session_added_set: return None
 
-    lastfm_info = get_artist_details(clean_name, api_key)
-    if not lastfm_info: return None
-
-    # 3. Calculate Scores
-    tags = [t['name'].lower() for t in lastfm_info['tags']['tag']]
-    VALENCE_SCORES = {'happy': 0.9, 'party': 0.9, 'pop': 0.8, 'sad': 0.2, 'dark': 0.15, 'doom': 0.1, 'metal': 0.3}
+    tags, tag_energy = get_lastfm_tags(clean_name)
+    if not tags: return None
     
-    def score(d):
-        h = [v for k,v in d.items() for t in tags if k in t]
-        return sum(h)/len(h) if h else 0.5
-
-    tag_energy = get_lastfm_tags(clean_name)[1] # Re-use existing function for energy logic
-    tag_valence = score(VALENCE_SCORES)
+    valence = get_audiodb_mood(clean_name)
     main_genre = tags[0].title() if tags else "Unknown"
+    release_year = get_release_year(d_info['id'])
 
-    # 4. GET RELEASE YEAR
-    release_year = 0
-    if deezer_info.get('id'):
-        release_year = get_release_year(deezer_info['id'])
-
-
-    # 5. INSERT PARENT ARTIST (SQL)
+    # 3. INSERT/UPDATE Parent Artist (SQL)
     artist_data = {
-        "Artist": clean_name, "Genre": main_genre,
-        "Monthly Listeners": deezer_info['listeners'], "Image URL": deezer_info['image'],
-        "Valence": tag_valence, "Tag_Energy": tag_energy,
+        "Artist": clean_name, "Genre": main_genre, "Monthly Listeners": d_info['listeners'],
+        "Image URL": d_info['image'], "Valence": valence, "Tag_Energy": tag_energy,
         "First Release Year": release_year
     }
     artist_id = add_artist(artist_data)
 
-    # 6. LIVE AUDIO ANALYSIS (MULTI-TRACK LOOP)
-    # Fetch top tracks for this artist
-    tracks = get_top_tracks_previews(deezer_info['id'], limit=LIVE_TRACK_LIMIT)
+    # 4. LIVE AUDIO ANALYSIS (MULTI-TRACK LOOP)
+    tracks = get_top_tracks_previews(d_info['id']) 
     analyzed_count = 0
     
-    # Container for the first valid track to return for immediate UI display
-    first_valid_phys = None
+    for t in tracks:
+        phys = analyze_audio(t['preview'])
+        if phys:
+            track_record = {**phys, "title": t['title'], "preview_url": t['preview']}
+            add_track(artist_id, track_record)
+            analyzed_count += 1
+            time.sleep(0.5)
 
-    if tracks:
-        for t in tracks:
-            phys = analyze_audio(t['preview'])
-            if phys:
-                if not first_valid_phys: first_valid_phys = phys
-                
-                # Save track with REAL TITLE
-                track_rec = {**phys, "title": t['title'], "preview": t['preview']}
-                add_track(artist_id, track_rec)
-                analyzed_count += 1
-
-    # 7. Synthesize Scores (Update Parent)
+    # 5. Synthesize Scores
     if analyzed_count > 0:
         synthesize_scores(artist_id)
-
-    # 8. Return Data for UI 
+    
+    # 6. Return Data for UI 
     final_data = artist_data.copy()
-    if first_valid_phys:
-        final_data['Audio_BPM'] = first_valid_phys['bpm']
-        final_data['Audio_Brightness'] = first_valid_phys['brightness']
-        final_data['Audio_Noisiness'] = first_valid_phys['noisiness']
-        final_data['Audio_Warmth'] = first_valid_phys['warmth']
-        final_data['Audio_Complexity'] = first_valid_phys['complexity']
+    if 'phys' in locals() and phys:
+        final_data['Audio_BPM'] = phys['bpm']
+        final_data['Audio_Brightness'] = phys['brightness']
     else:
-        # Fallback to defaults if no audio could be analyzed live
         final_data['Audio_BPM'] = 0
-        final_data['Audio_Brightness'] = tag_energy 
+        final_data['Audio_Brightness'] = tag_energy
 
     session_added_set.add(clean_name.strip().lower())
     return final_data
