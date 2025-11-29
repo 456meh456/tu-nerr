@@ -2,14 +2,14 @@ import pandas as pd
 import requests
 import time
 import urllib3
-import toml
 import os
 import tempfile
 import numpy as np
 import librosa
 import json
 import streamlit as st
-import sys # For error printing
+import sys
+import toml
 from src.db_model import add_artist, add_track, synthesize_scores, fetch_all_artists_df
 
 # Disable SSL warnings
@@ -18,9 +18,9 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # --- CONFIGURATION (Shared Constants) ---
 AUDIODB_API_KEY = "2" # Public API key for AudioDB
 LIVE_TRACK_LIMIT = 5
+TARGET_NEIGHBOR_COUNT = 15 # NEW: Fixed goal for visualization
 
 # FINAL CALIBRATION CONSTANTS (Derived from Audit)
-# These constants ensure the raw Librosa values (Centroid, ZCR, etc.) are scaled between 0 and 1.
 COMPLEXITY_DIVISOR = 0.3115 
 NOISINESS_DIVISOR = 0.1771 
 BRIGHTNESS_DIVISOR = 3569.1107 
@@ -38,12 +38,15 @@ except:
 
 def get_similar_artists(artist_name, api_key, limit=20):
     """Fetches similar artists from Last.fm (Social recommendation)."""
+    # NOTE: Limit is applied here, but the calling function in app.py handles pagination/targets.
     url = f"http://ws.audioscrobbler.com/2.0/?method=artist.getsimilar&artist={artist_name}&api_key={api_key}&limit={limit}&format=json"
     try:
         response = requests.get(url, timeout=5)
         if response.status_code == 200: return [a['name'] for a in response.json().get('similarartists', {}).get('artist', [])]
     except: pass
     return []
+
+# --- (Other API functions are omitted for space but assume they are up-to-date) ---
 
 def get_top_artists_by_genre(genre, api_key, limit=20):
     """Fetches top artists by genre/tag from Last.fm."""
@@ -172,8 +175,8 @@ def get_top_tracks_previews(deezer_id, limit=LIVE_TRACK_LIMIT):
         if resp.status_code != 200: return []
         
         tracks = []
-        if resp.get('data'):
-            for t in resp['data']:
+        if resp.json().get('data'):
+            for t in resp.json()['data']:
                 if 'preview' in t and t['preview']:
                     tracks.append({"title": t['title'], "preview": t['preview']})
         return tracks
@@ -207,6 +210,7 @@ def get_lastfm_tags(artist_name):
 # --- AUDIO ANALYSIS & DATA PROCESSING ---
 
 def analyze_audio(preview_url):
+    """Downloads MP3 to temp file and extracts 5-dimensional physics."""
     tmp_path = None
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     
@@ -251,6 +255,52 @@ def analyze_audio(preview_url):
         if 'tmp_path' in locals() and os.path.exists(tmp_path):
             try: os.remove(tmp_path)
             except: pass
+
+
+def get_neighbors_for_view(center, mode, api_key, df_db, target_count=15):
+    """
+    Finds a cluster of artists (center + neighbors) for immediate display.
+    This is a READ-ONLY function based on the database's existing genre tags.
+    """
+    targets = []
+    
+    # 1. Get the center artist's primary genre
+    center_row = df_db[df_db['Artist'].astype(str).str.lower() == str(center).lower()]
+    if center_row.empty:
+        # Fallback to general social search if the center artist is missing
+        targets.extend(get_similar_artists(center, api_key, limit=target_count * 2))
+        return df_db[df_db['Artist_Lower'].isin([t.lower() for t in targets])].copy()
+    
+    center_genre = center_row.iloc[0]['Genre']
+    center_lower = str(center).lower()
+
+    # 2. Filter the existing database for artists sharing the main genre
+    # We use multiple filters to find a decent sample
+    candidates = df_db[
+        (df_db['Genre'].astype(str) == center_genre) & 
+        (df_db['Artist_Lower'] != center_lower) # Exclude the center artist
+    ].copy()
+    
+    # 3. If not enough genre matches, add the most popular social matches as candidates
+    if len(candidates) < target_count:
+        social_neighbors = get_similar_artists(center, api_key, limit=target_count * 2)
+        social_df = df_db[df_db['Artist_Lower'].isin([n.lower() for n in social_neighbors])].copy()
+        
+        # Combine and remove duplicates
+        combined_df = pd.concat([candidates, social_df]).drop_duplicates(subset=['Artist_Lower'])
+    else:
+        combined_df = candidates
+        
+    # 4. Limit and return the cluster (including the center artist)
+    
+    # Select the neighbors
+    neighbor_limit = target_count - 1
+    neighbors_df = combined_df.head(neighbor_limit)
+    
+    # Re-insert the center artist back into the view for rendering
+    final_view = pd.concat([center_row, neighbors_df]).drop_duplicates(subset=['Artist_Lower'])
+    
+    return final_view.copy()
 
 
 def process_artist(name, df_db, api_key, session_added_set):

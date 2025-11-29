@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import time
+import random 
 
 # --- IMPORT MODULES ---
 from src.db_model import fetch_all_artists_df, delete_artist
@@ -14,33 +15,33 @@ st.title("🎵 tu-nerr: The Discovery Engine")
 
 # --- CORE LOGIC FLOW ---
 
-def run_discovery(center, mode, api_key, df_db):
-    """Central logic for finding and processing a cluster of artists."""
+def run_discovery_and_commit(center, mode, api_key, df_db):
+    """
+    Original function for committing NEW data. This is only called when 
+    a user launches a search for a band that may be missing.
+    """
     targets = []
     with st.spinner(f"Scanning: {center}..."):
         if mode == "Artist":
-            targets.append(center)
+            targets.append(center) # The center node itself
+            # Increase limit to force deeper search
             similar = get_similar_artists(center, api_key, limit=20) 
             targets.extend(similar)
         else:
             targets = get_top_artists_by_genre(center, api_key, limit=20)
     
-    targets = list(set(targets))
+    targets = list(set(targets)) # Deduplicate initial targets
 
     session_data = []
     prog = st.progress(0)
     
-    # Initialize set to track processed artists during this run
-    session_added_set = set()
+    session_added_set = set(df_db['Artist_Lower'].tolist()) if not df_db.empty else set()
         
     for i, artist in enumerate(targets):
         prog.progress((i + 1) / len(targets))
         
-        if artist.strip().lower() in session_added_set: continue
-            
-        # Process: Checks DB -> Fetches API -> Analyzes Audio -> Saves to SQL
+        # Process: Checks DB -> Fetches API -> Analyzes Audio -> Saves to SQL (SLOW PATH)
         data = process_artist(artist, df_db, api_key, session_added_set)
-        
         if data: 
             session_data.append(data)
             session_added_set.add(data['Artist'].lower())
@@ -56,13 +57,6 @@ def run_discovery(center, mode, api_key, df_db):
         st.session_state.view_source = "Social"
         return True
     return False
-
-def run_discovery_and_commit(center, mode, api_key, df_db):
-    """
-    Original function for committing NEW data. This is only called when 
-    a user launches a search for a band that may be missing.
-    """
-    return run_discovery(center, mode, api_key, df_db)
 
 # --- 1. INITIAL LOAD ---
 try:
@@ -135,9 +129,11 @@ with st.sidebar:
                     else:
                         # 3. If new, run the slow commit path
                         if run_discovery_and_commit(query, mode, key, df_db): 
+                            st.success(f"Artist '{query}' successfully analyzed and added to the database. Refreshing map...")
                             st.rerun()
                         else: 
-                            st.error(f"'{query}' not found. It will be added to the harvest queue. Please check back in 5 minutes.")
+                            st.error(f"'{query}' not found by APIs. If the band exists, please run the 'bulk_harvester.py' script locally to attempt addition.")
+                            
 
                 except Exception as e: st.error(f"Search error: {e}")
     
@@ -150,7 +146,6 @@ with st.sidebar:
                               help="Filter by rhythmic density. Low = Melodic/Smooth. High = Percussive/Rap.")
 
     st.divider()
-    
     if st.button("🔄 Reset / Global Map"):
         st.session_state.initial_run_complete = False 
         if 'view_df' in st.session_state: del st.session_state['view_df']
@@ -228,7 +223,6 @@ if selected:
             else: st.error("Not enough data for AI analysis. (Need 5+ bands)")
 
     try:
-        # Load detailed row data from DB
         row = df_db[df_db['Artist'] == selected]
         
         # Handle case where selected node is in graph but not in current DB snapshot
@@ -259,36 +253,32 @@ if selected:
                     st.caption(f"🎵 {preview['title']}")
             
             # Vibe Meters
-            # Prioritize Audio Brightness if available
-            audio_b = float(r.get('Audio_Brightness', 0))
-            tag_e = float(r.get('Tag_Energy', 0.5))
-            energy = audio_b if audio_b > 0 else tag_e
-            v_val = float(r.get('Valence', 0.5))
+            energy = float(r.get('Audio_Brightness', 0) or r.get('Tag_Energy', 0.5))
             noise = float(r.get('Audio_Noisiness', 0))
+            v_val = float(r.get('Valence', 0.5))
             
             st.metric("Fans", f"{int(r['Monthly Listeners']):,}")
             st.metric("BPM", int(r.get('Audio_BPM', 0)))
             
             st.caption(f"🔥 Energy (Intensity): {energy:.2f}")
             st.progress(energy)
+            
             st.caption(f"😊 Mood (Happiness): {v_val:.2f}")
             st.progress(v_val)
+
             st.caption(f"🌊 Texture (Noisiness): {noise:.2f}")
             st.progress(noise)
 
-        # COLUMN 2: Bio & Top Tracks
         with col2:
             key = st.secrets["lastfm_key"]
-            with st.spinner("Fetching biography and track list..."):
+            with st.spinner("Fetching biography..."):
                 det = get_artist_details(selected, key)
                 tracks = get_top_tracks(selected, key)
             
-            if det and 'bio' in det: 
-                st.info(det['bio']['summary'].split("<a href")[0])
-            
+            if det and 'bio' in det: st.info(det['bio']['summary'].split("<a href")[0])
             if tracks:
                 t_data = [{"Song": t['name'], "Plays": f"{int(t['playcount']):,}", "Link": t.get('url', '#')} for t in tracks]
-                st.dataframe(pd.DataFrame(t_data), column_config={"Link": st.column_config.LinkColumn("Link")}, hide_index=True)
+                st.dataframe(pd.DataFrame(t_data), column_config={"Link": st.column_config.LinkColumn("Listen")}, hide_index=True)
 
     except Exception as e:
         st.error(f"Dashboard Load Error: {e}")
