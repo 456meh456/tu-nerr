@@ -48,58 +48,77 @@ def get_ai_neighbors(center_artist, df_db, n_neighbors=5):
 def get_track_neighbors(artist_name, track_title, n_neighbors=5):
     """
     Finds songs (rows in the tracks table) mathematically similar to the single target track.
-    
-    This requires a fresh database query to join artists and tracks for the vector comparison.
+    Uses native Supabase join syntax instead of raw SQL RPC.
     """
     from src.db_model import get_supabase_client
     supabase = get_supabase_client()
     if not supabase: return pd.DataFrame()
 
-    # 1. Fetch full relational data (Artist + all Track data)
-    # This query pulls all track records and their parent artist names
-    query = """
-    SELECT
-        t.title, 
-        t.bpm, t.brightness, t.noisiness, t.warmth, t.complexity,
-        a.name AS artist_name, a.valence, a.tag_energy, a.image_url
-    FROM
-        tracks t
-    JOIN
-        artists a ON t.artist_id = a.id;
-    """
-    
     try:
-        data = supabase.rpc('execute_sql', {'query_string': query}).execute()
-        df_tracks = pd.DataFrame(data.data)
-    except Exception as e:
-        # NOTE: If Supabase doesn't allow stored procedure (rpc), this needs raw client connection
-        print(f"SQL Error fetching tracks for KNN: {e}")
-        return pd.DataFrame()
+        # 1. Fetch joined data using Supabase syntax
+        # We select all track columns and the specific artist columns we need
+        response = supabase.table("tracks").select(
+            "*, artists!inner(name, valence, tag_energy, image_url)"
+        ).execute()
+        
+        raw_data = response.data
+        if not raw_data: return pd.DataFrame()
 
+        # 2. Flatten the response (artists data comes nested in a dict)
+        flat_data = []
+        for row in raw_data:
+            artist_info = row.pop('artists', {})
+            # Merge artist info into the flat row
+            row['artist_name'] = artist_info.get('name')
+            row['valence'] = artist_info.get('valence')
+            row['tag_energy'] = artist_info.get('tag_energy')
+            row['image_url'] = artist_info.get('image_url')
+            flat_data.append(row)
+            
+        df_tracks = pd.DataFrame(flat_data)
+        
+    except Exception as e:
+        print(f"Error fetching tracks: {e}")
+        return pd.DataFrame()
 
     if df_tracks.empty: return pd.DataFrame()
 
-    # 2. Define and scale features (using raw track data + Valence from artist)
-    features = df_tracks[['bpm', 'brightness', 'noisiness', 'warmth', 'complexity', 'valence']].fillna(0).values
+    # 3. Define and scale features
+    # Use raw track physics + artist-level valence
+    feature_cols = ['bpm', 'brightness', 'noisiness', 'warmth', 'complexity', 'valence']
+    
+    # Ensure columns exist and are numeric
+    for col in feature_cols:
+        if col not in df_tracks.columns: df_tracks[col] = 0.0
+        df_tracks[col] = pd.to_numeric(df_tracks[col], errors='coerce').fillna(0)
+
+    features = df_tracks[feature_cols].values
     
     scaler = StandardScaler()
     features_scaled = scaler.fit_transform(features)
     
-    knn = NearestNeighbors(n_neighbors=min(n_neighbors + 1, len(df_tracks)), metric='cosine') # Cosine better for vectors
+    knn = NearestNeighbors(n_neighbors=min(n_neighbors + 1, len(df_tracks)), metric='cosine') 
     knn.fit(features_scaled)
 
-    # 3. Find the target track's vector
-    target_idx = df_tracks[(df_tracks['artist_name'] == artist_name) & (df_tracks['title'] == track_title)].index
-    if target_idx.empty: return pd.DataFrame()
+    # 4. Find the target track's vector
+    # Case-insensitive match for robustness
+    target_idx = df_tracks[
+        (df_tracks['artist_name'].str.lower() == str(artist_name).lower()) & 
+        (df_tracks['title'].str.lower() == str(track_title).lower())
+    ].index
+    
+    if target_idx.empty: 
+        print(f"Target track '{track_title}' by '{artist_name}' not found in track DB.")
+        return pd.DataFrame()
 
     target_vector_scaled = features_scaled[target_idx[0]].reshape(1, -1)
     
-    # 4. Get Neighbors
-    distances, indices = knn.kneighbors(target_vector_scaled, n_neighbors=n_neighbors + 1)
+    # 5. Get Neighbors
+    distances, indices = knn.kneighbors(target_vector_scaled, n_neighbors=min(n_neighbors + 1, len(df_tracks)))
     
-    neighbor_indices = indices.flatten()[1:]
+    neighbor_indices = indices.flatten()[1:] # Skip the first one (it's the target itself)
     
-    # 5. Return the resulting rows
+    # 6. Return the resulting rows
     return df_tracks.iloc[neighbor_indices]
 
 
