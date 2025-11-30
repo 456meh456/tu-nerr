@@ -6,12 +6,14 @@ import random
 # --- IMPORT MODULES ---
 from src.db_model import fetch_all_artists_df, delete_artist
 from src.api_handler import get_similar_artists, get_top_artists_by_genre, process_artist, get_artist_details, get_top_tracks, get_deezer_data, get_deezer_preview, get_neighbors_for_view
-from src.ai_engine import get_ai_neighbors, generate_territory_map
+from src.ai_engine import get_ai_neighbors, generate_territory_map, get_track_neighbors
 from src.visuals import render_graph 
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(layout="wide", page_title="tu-nerr")
+# --- BRANDING FIX: Removing external logo and reverting to simple title ---
 st.title("🎵 tu-nerr: The Discovery Engine")
+# --- END BRANDING FIX ---
 
 # --- CORE LOGIC FLOW ---
 
@@ -24,7 +26,6 @@ def run_discovery_and_commit(center, mode, api_key, df_db):
     with st.spinner(f"Scanning: {center}..."):
         if mode == "Artist":
             targets.append(center) # The center node itself
-            # Increase limit to force deeper search
             similar = get_similar_artists(center, api_key, limit=20) 
             targets.extend(similar)
         else:
@@ -139,9 +140,8 @@ with st.sidebar:
     
     st.divider()
     
-    # --- NEW: TEXTURE SLIDER ---
+    # --- VIBE FILTERS ---
     st.subheader("🎛️ Vibe Filters")
-    # Default 0.0 to 1.0 shows everything. User can constrict the range.
     texture_range = st.slider("Texture (Noisiness)", 0.0, 1.0, (0.0, 1.0), 
                               help="Filter by rhythmic density. Low = Melodic/Smooth. High = Percussive/Rap.")
 
@@ -176,7 +176,6 @@ source = st.session_state.get('view_source', 'Social')
 
 # --- FILTER LOGIC ---
 if not disp_df.empty and 'Audio_Noisiness' in disp_df.columns:
-    # Apply the slider filter to the dataframe before rendering
     min_noise, max_noise = texture_range
     disp_df = disp_df[
         (disp_df['Audio_Noisiness'] >= min_noise) & 
@@ -205,15 +204,13 @@ if selected:
     with c2:
         # 1. TRAVEL BUTTON
         if st.button("🔭 Travel Here (Social)", type="primary"):
-            # If traveling, we run the fast read function
             st.session_state.view_df = get_neighbors_for_view(selected, "Artist", st.secrets["lastfm_key"], df_db)
             st.session_state.center_node = selected
             st.session_state.view_source = "Social"
             st.rerun()
             
-        # 2. AI BUTTON
-        if st.button("🤖 AI Neighbors"):
-            # Pass full DB to AI engine for best results
+        # 2. AI BUTTON (Band-Level KNN)
+        if st.button("🤖 AI Neighbors (Band)"):
             ai_recs = get_ai_neighbors(selected, df_db)
             if not ai_recs.empty:
                 st.session_state.view_df = ai_recs
@@ -225,14 +222,13 @@ if selected:
     try:
         row = df_db[df_db['Artist'] == selected]
         
-        # Handle case where selected node is in graph but not in current DB snapshot
         if row.empty:
             d_live = get_deezer_data(selected)
             r = {
                 'Image URL': d_live['image'] if d_live else '',
                 'Audio_BPM': 0, 'Audio_Brightness': 0.5, 'Tag_Energy': 0.5, 'Valence': 0.5,
                 'Monthly Listeners': d_live['listeners'] if d_live else 0, 'Genre': 'Unknown',
-                'Audio_Noisiness': 0.5 # Default for unknown
+                'Audio_Noisiness': 0.5 
             }
         else:
             r = row.iloc[0]
@@ -244,7 +240,6 @@ if selected:
             img = r.get('Image URL')
             if img and str(img).startswith("http"): st.image(img)
             
-            # Live Audio Fetch (we don't store the MP3 url in the main table to keep it light)
             d_live = get_deezer_data(selected)
             if d_live and d_live.get('id'):
                 preview = get_deezer_preview(d_live['id'])
@@ -260,7 +255,7 @@ if selected:
             st.metric("Fans", f"{int(r['Monthly Listeners']):,}")
             st.metric("BPM", int(r.get('Audio_BPM', 0)))
             
-            st.caption(f"🔥 Energy (Intensity): {energy:.2f}")
+            st.caption(f"🔥 Intensity: {energy:.2f}")
             st.progress(energy)
             
             st.caption(f"😊 Mood (Happiness): {v_val:.2f}")
@@ -277,8 +272,66 @@ if selected:
             
             if det and 'bio' in det: st.info(det['bio']['summary'].split("<a href")[0])
             if tracks:
-                t_data = [{"Song": t['name'], "Plays": f"{int(t['playcount']):,}", "Link": t.get('url', '#')} for t in tracks]
-                st.dataframe(pd.DataFrame(t_data), column_config={"Link": st.column_config.LinkColumn("Listen")}, hide_index=True)
+                st.subheader("Top Tracks Analysis") 
+                
+                # 1. Map Last.fm track list to a DataFrame
+                track_data_list = []
+                for track in tracks:
+                    track_data_list.append({
+                        "Song": track['name'], 
+                        "Link": track.get('url', '#'),
+                        "Map": False, # Placeholder for button/selection
+                        "artist_name": selected 
+                    })
+                
+                df_track_list = pd.DataFrame(track_data_list)
+                
+                # 2. Display with interactive button
+                edited_df = st.data_editor(
+                    df_track_list,
+                    column_config={
+                        "Link": st.column_config.LinkColumn("Listen", width="small"),
+                        "Map": st.column_config.ButtonColumn("Map This Vibe", help="Find artists similar to this specific track.", disabled="Map This Vibe" != "Map This Vibe"),
+                        "artist_name": None 
+                    },
+                    hide_index=True,
+                    use_container_width=True,
+                    num_rows="dynamic",
+                )
+                
+                # 3. Check for button click (Track-Level Discovery)
+                if 'Map' in edited_df.columns:
+                    for i, row in edited_df.iterrows():
+                        if row['Map']:
+                            # Trigger track-based AI search
+                            st.session_state.center_track_title = row['Song']
+                            st.session_state.center_artist = selected
+                            st.session_state.track_map_requested = True
+                            st.rerun()
+
+            # --- Handle Track-Map Result ---
+            if st.session_state.get('track_map_requested', False):
+                st.session_state.track_map_requested = False
+                
+                track_title = st.session_state.center_track_title
+                artist_name = st.session_state.center_artist
+                
+                with st.spinner(f"Mapping vibe of: {track_title}..."):
+                    track_recs_df = get_track_neighbors(artist_name, track_title)
+                    
+                    if not track_recs_df.empty:
+                        # Extract unique artist names for the node display
+                        artist_names = track_recs_df['artist_name'].unique().tolist()
+                        
+                        # Fetch the full artist profiles for the graph view
+                        full_artist_profiles = df_db[df_db['Artist'].isin(artist_names)].copy()
+                        
+                        st.session_state.view_df = full_artist_profiles
+                        st.session_state.center_node = selected 
+                        st.session_state.view_source = "AI (Track)"
+                        st.rerun()
+                    else:
+                        st.error(f"Could not find sufficient data in the tracks table for '{track_title}'.")
 
     except Exception as e:
         st.error(f"Dashboard Load Error: {e}")

@@ -11,85 +11,115 @@ try:
 except ImportError:
     HAS_UMAP = False
 
+# --- KNN MODEL FOR ARTIST COMPOSITE SCORES ---
 @st.cache_data(ttl=600)
 def get_ai_neighbors(center_artist, df_db, n_neighbors=5):
-    """Finds mathematically similar artists using Audio Physics and Mood."""
+    """Finds mathematically similar artists using Composite Audio Physics (Artist Table)."""
     
     if len(df_db) < 5: 
-        # Not enough data for meaningful neighbors
         return pd.DataFrame()
     
-    # 1. HYBRID FEATURE CONSTRUCTION
     df_calc = df_db.copy()
     
-    # Normalize names for lookup
-    df_calc['lookup_name'] = df_calc['Artist'].astype(str).str.strip().str.lower()
-    target = str(center_artist).strip().lower()
-
-    # Create the primary Energy metric: prefer Audio Brightness, fall back to Tag Energy
-    df_calc['Energy_Feature'] = df_calc.apply(
-        lambda x: x.get('Audio_Brightness', 0) if x.get('Audio_Brightness', 0) > 0 else x.get('Tag_Energy', 0.5), axis=1
-    )
+    # Use only the composite audio features for KNN training
+    features = df_calc[['Audio_Brightness', 'Valence', 'Audio_BPM', 'Audio_Noisiness', 'Audio_Warmth', 'Audio_Complexity']].fillna(0).values
     
-    # 2. FEATURE MATRIX
-    # Use Energy (Timbre/Intensity), Valence (Mood), and Tempo (BPM)
-    features = df_calc[['Energy_Feature', 'Valence', 'Audio_BPM']].fillna(0).values
-    
-    # 3. SCALE DATA
     scaler = StandardScaler()
     features_scaled = scaler.fit_transform(features)
     
-    # 4. FIT MODEL
     knn = NearestNeighbors(n_neighbors=min(n_neighbors + 1, len(df_db)), metric='euclidean')
     knn.fit(features_scaled)
     
-    # 5. FIND NEIGHBORS
-    center_idx = df_calc[df_calc['lookup_name'] == target].index
-    
-    if center_idx.empty: 
-        return pd.DataFrame()
+    target_idx = df_db[df_db['Artist'] == center_artist].index
+    if target_idx.empty: return pd.DataFrame()
         
-    target_index = center_idx[0]
-    distances, indices = knn.kneighbors([features_scaled[target_index]])
+    target_index = target_idx[0]
     
-    neighbor_indices = indices[0][1:] 
+    target_vector_scaled = features_scaled[target_index].reshape(1, -1)
+    distances, indices = knn.kneighbors(target_vector_scaled, n_neighbors=min(n_neighbors + 1, len(df_db)))
+    
+    neighbor_indices = indices.flatten()[1:] 
     return df_db.iloc[neighbor_indices]
 
+
+# --- NEW FEATURE: TRACK-LEVEL KNN ---
+
+@st.cache_data(ttl=600)
+def get_track_neighbors(artist_name, track_title, n_neighbors=5):
+    """
+    Finds songs (rows in the tracks table) mathematically similar to the single target track.
+    
+    This requires a fresh database query to join artists and tracks for the vector comparison.
+    """
+    from src.db_model import get_supabase_client
+    supabase = get_supabase_client()
+    if not supabase: return pd.DataFrame()
+
+    # 1. Fetch full relational data (Artist + all Track data)
+    # This query pulls all track records and their parent artist names
+    query = """
+    SELECT
+        t.title, 
+        t.bpm, t.brightness, t.noisiness, t.warmth, t.complexity,
+        a.name AS artist_name, a.valence, a.tag_energy, a.image_url
+    FROM
+        tracks t
+    JOIN
+        artists a ON t.artist_id = a.id;
+    """
+    
+    try:
+        data = supabase.rpc('execute_sql', {'query_string': query}).execute()
+        df_tracks = pd.DataFrame(data.data)
+    except Exception as e:
+        # NOTE: If Supabase doesn't allow stored procedure (rpc), this needs raw client connection
+        print(f"SQL Error fetching tracks for KNN: {e}")
+        return pd.DataFrame()
+
+
+    if df_tracks.empty: return pd.DataFrame()
+
+    # 2. Define and scale features (using raw track data + Valence from artist)
+    features = df_tracks[['bpm', 'brightness', 'noisiness', 'warmth', 'complexity', 'valence']].fillna(0).values
+    
+    scaler = StandardScaler()
+    features_scaled = scaler.fit_transform(features)
+    
+    knn = NearestNeighbors(n_neighbors=min(n_neighbors + 1, len(df_tracks)), metric='cosine') # Cosine better for vectors
+    knn.fit(features_scaled)
+
+    # 3. Find the target track's vector
+    target_idx = df_tracks[(df_tracks['artist_name'] == artist_name) & (df_tracks['title'] == track_title)].index
+    if target_idx.empty: return pd.DataFrame()
+
+    target_vector_scaled = features_scaled[target_idx[0]].reshape(1, -1)
+    
+    # 4. Get Neighbors
+    distances, indices = knn.kneighbors(target_vector_scaled, n_neighbors=n_neighbors + 1)
+    
+    neighbor_indices = indices.flatten()[1:]
+    
+    # 5. Return the resulting rows
+    return df_tracks.iloc[neighbor_indices]
+
+
+# --- UMAP Logic (for Global View, unchanged) ---
 @st.cache_data(ttl=3600)
 def generate_territory_map(df_db):
-    """
-    Generates 2D coordinates for the global map using UMAP.
-    If UMAP is missing or data is sparse, returns the original DF (Visuals will handle fallback).
-    """
-    if len(df_db) < 15 or not HAS_UMAP:
-        # Not enough data for UMAP or library missing -> Return as is
-        # Visuals.py will default to random/grid layout
-        return df_db
-        
-    # 1. Prepare Features
+    if len(df_db) < 15 or not HAS_UMAP: return df_db
+    
     df_calc = df_db.copy()
     df_calc['Energy_Feature'] = df_calc.apply(
         lambda x: x.get('Audio_Brightness', 0) if x.get('Audio_Brightness', 0) > 0 else x.get('Tag_Energy', 0.5), axis=1
     )
     
-    # Use 5 Dimensions for the map
     features = df_calc[['Energy_Feature', 'Valence', 'Audio_BPM', 'Monthly Listeners']].fillna(0).values
-    
-    # 2. Scale
     scaled_data = StandardScaler().fit_transform(features)
     
-    # 3. Run UMAP
-    # n_neighbors=15 balances local vs global structure
-    try:
-        reducer = umap.UMAP(n_neighbors=15, min_dist=0.1, metric='euclidean', random_state=42)
-        embedding = reducer.fit_transform(scaled_data)
-        
-        # 4. Assign Coordinates back to DF
-        # We repurpose Valence/Energy columns in the view_df OR add new ones.
-        # For now, let's add explicit UMAP columns
-        df_db['UMAP_X'] = embedding[:, 0]
-        df_db['UMAP_Y'] = embedding[:, 1]
-        return df_db
-    except Exception as e:
-        print(f"UMAP Failed: {e}")
-        return df_db
+    reducer = umap.UMAP(n_neighbors=15, min_dist=0.1, metric='euclidean', random_state=42)
+    embedding = reducer.fit_transform(scaled_data)
+    
+    df_db['UMAP_X'] = embedding[:, 0]
+    df_db['UMAP_Y'] = embedding[:, 1]
+    
+    return df_db
