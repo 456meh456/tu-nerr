@@ -6,14 +6,12 @@ import random
 # --- IMPORT MODULES ---
 from src.db_model import fetch_all_artists_df, delete_artist
 from src.api_handler import get_similar_artists, get_top_artists_by_genre, process_artist, get_artist_details, get_top_tracks, get_deezer_data, get_deezer_preview, get_neighbors_for_view
-from src.ai_engine import get_ai_neighbors, generate_territory_map, get_track_neighbors
+from src.ai_engine import get_ai_neighbors, generate_territory_map, get_track_neighbors # FIX: Added get_track_neighbors
 from src.visuals import render_graph 
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(layout="wide", page_title="tu-nerr")
-# --- BRANDING FIX: Removing external logo and reverting to simple title ---
 st.title("🎵 tu-nerr: The Discovery Engine")
-# --- END BRANDING FIX ---
 
 # --- CORE LOGIC FLOW ---
 
@@ -176,6 +174,7 @@ source = st.session_state.get('view_source', 'Social')
 
 # --- FILTER LOGIC ---
 if not disp_df.empty and 'Audio_Noisiness' in disp_df.columns:
+    # Apply the slider filter to the dataframe before rendering
     min_noise, max_noise = texture_range
     disp_df = disp_df[
         (disp_df['Audio_Noisiness'] >= min_noise) & 
@@ -204,6 +203,7 @@ if selected:
     with c2:
         # 1. TRAVEL BUTTON
         if st.button("🔭 Travel Here (Social)", type="primary"):
+            # If traveling, we run the fast read function
             st.session_state.view_df = get_neighbors_for_view(selected, "Artist", st.secrets["lastfm_key"], df_db)
             st.session_state.center_node = selected
             st.session_state.view_source = "Social"
@@ -211,6 +211,7 @@ if selected:
             
         # 2. AI BUTTON (Band-Level KNN)
         if st.button("🤖 AI Neighbors (Band)"):
+            # Pass full DB to AI engine for best results
             ai_recs = get_ai_neighbors(selected, df_db)
             if not ai_recs.empty:
                 st.session_state.view_df = ai_recs
@@ -222,6 +223,7 @@ if selected:
     try:
         row = df_db[df_db['Artist'] == selected]
         
+        # Handle case where selected node is in graph but not in current DB snapshot
         if row.empty:
             d_live = get_deezer_data(selected)
             r = {
@@ -240,6 +242,7 @@ if selected:
             img = r.get('Image URL')
             if img and str(img).startswith("http"): st.image(img)
             
+            # Live Audio Fetch (we don't store the MP3 url in the main table to keep it light)
             d_live = get_deezer_data(selected)
             if d_live and d_live.get('id'):
                 preview = get_deezer_preview(d_live['id'])
